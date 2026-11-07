@@ -3,15 +3,19 @@
 
   guardian-wake check <event_id>    dedupe, waiting question cards, open-thread changes, footer
   guardian-wake footer ["Done step" ...]   print the footer after your edits (reads andy-items.json)
+     Each Needs you row folds to one short line (topic, since, any due date); clicking it shows the row and,
+     below it, a second fold with the advisors' ranked options from andy-items-advice.json.
   guardian-wake record <event_id> "<one plain sentence>"   save receipt + state line, lint handoff
 
 The guardian (any model) runs `check`, does the judgment steps it prints, then `record`."""
 import json, os, re, sqlite3, subprocess, sys, datetime
 HOME = os.path.expanduser("~")
 HANDOFF = f"{HOME}/Library/Caches/handoffs/2026-10-21-audit-all-t3-threads-for-dead-ends-25824f7b/HANDOFF-25824f7b.md"
-GUARDIAN = "mcp:launch:a2fabec20bde87d0a7aae294fff494d95f312968cd786d891d6bded76bc7cea5"
+GUARDIAN = "mcp:launch:367b6f5597bc3de526ed77911dd3d0fe36b03e18b1de4667e065d4a92ed05c0d"
 DIR = f"{HOME}/Library/Caches/open-threads"
-ITEMS = f"{DIR}/andy-items.json"      # Andy's open items: [{"n":2,"topic":"...","row":"..."}]
+ITEMS = f"{DIR}/andy-items.json"      # Andy's open items: [{"n":2,"topic":"...","row":"...","since":"2026-11-07","due":null}]
+ADVICE = f"{DIR}/andy-items-advice.json"  # ranked options from the Grok + Gemini advisors, by item number
+SEEN = f"{DIR}/andy-items-seen.json"      # per item: first day listed, plus its last known since/due/due_note
 DB = f"{HOME}/.t3/userdata/statev2.sqlite"
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -92,9 +96,93 @@ def footer(extra):
     print(f"| Done | ~~Check the latest watch alert~~ | {short} · 1 min |")
     for d in extra:
         print(f"|   | ~~{d}~~ | {short} · 1 min |")
+    advice = load(ADVICE, {})
+    seen = load(SEEN, {})
+    today = datetime.date.today()
     for it in items:
-        print(f"| Needs you | **{it['n']}. {it['topic']}** (still open) · {it['row']} |   |")
+        key = str(it["n"])
+        mem = seen.get(key)
+        mem = mem if isinstance(mem, dict) and mem.get("topic") == it["topic"] else {"topic": it["topic"], "first": today.isoformat()}
+        # a model editing andy-items.json can drop the date fields; the last known values fill the gap
+        for f in ("since", "due", "due_note"):
+            if it.get(f):
+                mem[f] = it[f]
+            elif f in it:
+                mem.pop(f, None)  # set to null on purpose: forget it
+            elif mem.get(f):
+                it[f] = mem[f]
+        seen[key] = mem
+        label = "Needs you" if it is items[0] else "  "  # label on the first row of the run only
+        print(f"| {label} | {needs_row(it, mem['first'], advice.get(key), today)} |   |")
+    save(SEEN, {k: v for k, v in seen.items() if k in {str(i["n"]) for i in items}})
     print(f"\n<sub>Decided for you -- · Skills -- · Written by {full} · {usage}</sub>")
+
+def load(path, default):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return default
+
+def save(path, data):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+def day(iso):
+    try:
+        return datetime.date.fromisoformat(str(iso)[:10])
+    except ValueError:
+        return None
+
+def cell(text):
+    """One table cell on one line: no line breaks, every literal | escaped once."""
+    return re.sub(r"(?<!\\)\|", r"\\|", " ".join(str(text).split()))
+
+def when(it, first_seen, today):
+    """'since 26 Oct · due 5 Nov, 2 days late' for the folded line; the due part only when there's a due date."""
+    since = day(it.get("since") or first_seen)
+    bits = [f"since {since.day} {since:%b}"] if since else []
+    due = day(it.get("due") or "")
+    if due:
+        left = (due - today).days
+        label = f"due {due.day} {due:%b}"
+        if left < 0:
+            bits.append(f'<span itemprop="over">{label}, {-left} day{"s" if left < -1 else ""} late</span>')
+        else:
+            bits.append(label + (", today" if left == 0 else ", tomorrow" if left == 1 else ""))
+    return " · ".join(bits)
+
+def advice_fold(adv):
+    """The advisors' ranked options, as a fold inside the item's fold: an optional finding, then each option with
+    each advisor's rank and strength, the reply, and their rationale. Empty when there's none for this item."""
+    opts = adv.get("options") or []
+    if not opts:
+        return ""
+    top = opts[0]
+    agree = adv.get("agreement") or ""
+    head = f"Grok + Gemini both pick: {top['label']}" if agree == "both pick it" else f"Grok + Gemini: {agree or top['label']}"
+    lines = [adv["finding"]] if adv.get("finding") else []
+    for i, o in enumerate(opts, 1):
+        votes = " · ".join(f"{who} {v}" for who, v in (("Grok", o.get("grok")), ("Gemini", o.get("gemini"))) if v)
+        reply = f" · <ins>Reply</ins> `{o['reply']}`" if o.get("reply") else ""
+        lines.append(f"**{i}. {o['label']}** · {votes}{reply}. {o.get('rationale', '')}")
+    if adv.get("note"):
+        lines.append(adv["note"])
+    if adv.get("by"):
+        lines.append(f"<sub>{adv['by']}</sub>")
+    return f"<details><summary>{head}</summary>{'<br>'.join(lines)}</details>"
+
+def needs_row(it, first_seen, adv, today):
+    """A Needs you row folded to one line: click it for the row's text and the advisors' fold."""
+    if adv and adv.get("topic") not in (None, it["topic"]):
+        adv = None  # advice written for a different item that once had this number
+    summary = f"**{it['n']}. {it['topic']}** · {when(it, first_seen, today)}"
+    note = f"*{it['due_note'][0].upper()}{it['due_note'][1:]}.* " if it.get("due_note") else ""
+    return cell(f"<details><summary>{summary}</summary>{note}{it['row']}{advice_fold(adv) if adv else ''}</details>")
 
 def lint(text):
     bad = [w for w in re.findall(r"[A-Za-z]{28,}", text) if not w.startswith("http")]
