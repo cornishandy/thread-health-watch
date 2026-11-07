@@ -1,0 +1,25 @@
+# Live data and private files: never commit these (see README, "Privacy").
+live/
+shadow/
+cutover/
+challenge/
+daily/
+dump/
+state*.json
+*.log
+*.log.*
+*.lock
+acks.jsonl
+open-outcomes.json
+open-outcomes.*.json
+!open-outcomes.example.json
+publication-config.json
+publication-state.json
+publication-report.json
+publication-tasks.md
+settled-log.jsonl
+HANDOFF-*.md
+private-patterns.txt
+__pycache__/
+*.pyc
+.DS_Store

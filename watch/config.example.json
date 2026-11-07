@@ -1,0 +1,16 @@
+{
+  "database": "~/.t3/userdata/statev2.sqlite",
+  "enabled": true,
+  "excluded_thread_ids": ["thread-example-excluded"],
+  "guardian_thread_id": "thread-example-guardian",
+  "scheduled_task_id": "scheduled-task-example",
+  "webhook_url": "https://example.invalid/placeholder",
+  "state_path": "state.json",
+  "log_path": "watch.log",
+  "lock_path": "watch.lock",
+  "acks_path": "acks.jsonl",
+  "shadow_log_path": "shadow.log",
+  "open_outcomes_path": "open-outcomes.example.json",
+  "guardian_chain_thread_ids": ["thread-example-guardian"],
+  "codex_sessions_dir": ""
+}

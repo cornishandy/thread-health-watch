@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""List Andy's unsettled top-level T3 threads with their last reply's verdict and open items.
+Read-only on T3's database. Writes ~/Library/Caches/open-threads/latest.json and prints a compact table."""
+import json, os, re, sqlite3, sys
+DB = os.path.expanduser("~/.t3/userdata/statev2.sqlite")
+con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+q = lambda s, *a: con.execute(s, a).fetchall()
+projects = {r[0]: r[1] for r in q("select project_id, title from projection_projects")} if True else {}
+rows = q("""select thread_id, project_id, title, payload_json from orchestration_v2_projection_threads
+ where deleted_at is null and archived_at is null
+ and json_extract(payload_json,'$.settledAt') is null
+ and json_extract(payload_json,'$.lineage.parentThreadId') is null""")
+out = []
+for tid, pid, title, pj in rows:
+    p = json.loads(pj)
+    run = q("select status, requested_at, completed_at from orchestration_v2_projection_runs where thread_id=? order by ordinal desc limit 1", tid)
+    human = q("""select created_at, json_extract(payload_json,'$.text') from orchestration_v2_projection_messages
+      where thread_id=? and role='user' and coalesce(json_extract(payload_json,'$.createdBy'),'user')='user'
+      order by created_at desc limit 1""", tid)
+    asst = q("""select created_at, json_extract(payload_json,'$.text') from orchestration_v2_projection_messages
+      where thread_id=? and role='assistant' and streaming=0 order by created_at desc limit 1""", tid)
+    # last assistant message that carries a footer
+    foot = q("""select created_at, json_extract(payload_json,'$.text') from orchestration_v2_projection_messages
+      where thread_id=? and role='assistant' and streaming=0 and json_extract(payload_json,'$.text') like '%itemprop="settle-%'
+      order by created_at desc limit 1""", tid)
+    ftext = foot[0][1] if foot else ""
+    verdict = "green" if 'settle-yes' in ftext else ("red" if 'settle-no' in ftext else "none")
+    m = re.search(r'settle-(?:yes|no)">[^<]*</span>\s*\|([^|]*)\|', ftext)
+    reason = m.group(1).strip() if m else ""
+    needs = re.findall(r'\|\s*(?:Needs you)?\s*\|\s*\*\*(\d+\.[^*]+)\*\*', ftext)
+    # Live work anywhere in this thread's tree, and children that finished after the last footer
+    live = q("""select count(*) from orchestration_v2_projection_runs r join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where json_extract(t.payload_json,'$.lineage.rootThreadId')=? and r.status in ('queued','preparing','starting','running','waiting')""", tid)[0][0]
+    after = q("""select t.title from orchestration_v2_projection_runs r join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where json_extract(t.payload_json,'$.lineage.rootThreadId')=? and t.thread_id<>? and r.completed_at > ? group by t.title""", tid, tid, foot[0][0] if foot else "")
+    body = ftext.split("\n---")[0] if ftext else (asst[0][1] if asst else "")
+    out.append(dict(id=tid, title=title, project=projects.get(pid, pid), created=p.get("createdAt"),
+        lastVisited=p.get("lastVisitedAt"), snoozedUntil=p.get("snoozedUntil"),
+        run=run[0][0] if run else None, runDone=run[0][2] if run else None,
+        lastHuman=human[0][0] if human else None, lastHumanText=(human[0][1] or "")[:160] if human else "",
+        lastReply=asst[0][0] if asst else None, footerAt=foot[0][0] if foot else None,
+        footerIsLast=bool(foot and asst and foot[0][0]==asst[0][0]),
+        verdict=verdict, reason=reason, needs=[n.strip() for n in needs],
+        unread=bool(asst and (not p.get("lastVisitedAt") or p["lastVisitedAt"] < asst[0][0])),
+        repliedAfter=bool(human and asst and human[0][0] > asst[0][0]),
+        liveRuns=live, childrenDoneAfterFooter=[a[0] for a in after] if foot else [],
+        staleRed=(verdict=="red" and live==0 and bool(re.search(r"running|in progress|due to report", reason, re.I))),
+        bodyHead=re.sub(r'\s+',' ',body)[:600]))
+out.sort(key=lambda r: r["lastReply"] or "", reverse=True)
+path = os.path.expanduser("~/Library/Caches/open-threads/latest.json")
+json.dump(out, open(path, "w"), indent=1)
+if "--json" not in sys.argv:
+    for r in out:
+        print(f'{r["verdict"]:5} {"UNREAD" if r["unread"] else "seen  "} run={r["run"]:<10} {(r["lastReply"] or "")[:16]} | {r["title"]} | {r["project"]} | {r["reason"][:50]} | needs={len(r["needs"])}{" STALE" if r["staleRed"] else ""}{" newer-child-results:"+str(len(r["childrenDoneAfterFooter"])) if r["childrenDoneAfterFooter"] else ""}')

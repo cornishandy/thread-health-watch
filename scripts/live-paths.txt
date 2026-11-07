@@ -1,0 +1,18 @@
+# repo path                      live path (the running copy; ~ is your home folder)
+watch/watch_v2.py                ~/Library/Caches/thread-watch-v2/watch_v2.py
+watch/triage.py                  ~/Library/Caches/thread-watch-v2/triage.py
+watch/metrics.py                 ~/Library/Caches/thread-watch-v2/metrics.py
+watch/replay_v2.py               ~/Library/Caches/thread-watch-v2/replay_v2.py
+watch/test_watch_v2.py           ~/Library/Caches/thread-watch-v2/test_watch_v2.py
+watch/publication_watch.py       ~/Library/Caches/thread-watch-v2/publication_watch.py
+watch/publication-launcher.mjs   ~/Library/Caches/thread-watch-v2/publication-launcher.mjs
+watch/test_publication_watch.py  ~/Library/Caches/thread-watch-v2/test_publication_watch.py
+watch/config.example.json        ~/Library/Caches/thread-watch-v2/config.example.json
+watch/open-outcomes.example.json ~/Library/Caches/thread-watch-v2/open-outcomes.example.json
+watch/GUARDIAN-PROMPT.md         ~/Library/Caches/thread-watch-v2/GUARDIAN-PROMPT.md
+docs/DESIGN.md                   ~/Library/Caches/thread-watch-v2/DESIGN.md
+bin/guardian-wake                ~/.claude/bin/guardian-wake
+bin/open-threads                 ~/.claude/bin/open-threads
+rules/guardian-attention.md      ~/.claude/rules-reference/guardian-attention.md
+stale/stale_sweep.py             ~/Library/Caches/stale-thread-triage/stale_sweep.py
+stale/test_stale_sweep.py        ~/Library/Caches/stale-thread-triage/test_stale_sweep.py

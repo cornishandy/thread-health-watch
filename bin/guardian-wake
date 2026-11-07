@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Mechanical part of each thread-guardian wake. Read-only on T3's database.
+
+  guardian-wake check <event_id>    dedupe, waiting question cards, open-thread changes, footer
+  guardian-wake footer ["Done step" ...]   print the footer after your edits (reads andy-items.json)
+  guardian-wake record <event_id> "<one plain sentence>"   save receipt + state line, lint handoff
+
+The guardian (any model) runs `check`, does the judgment steps it prints, then `record`."""
+import json, os, re, sqlite3, subprocess, sys, datetime
+HOME = os.path.expanduser("~")
+HANDOFF = f"{HOME}/Library/Caches/handoffs/2026-10-21-audit-all-t3-threads-for-dead-ends-25824f7b/HANDOFF-25824f7b.md"
+GUARDIAN = "mcp:launch:a2fabec20bde87d0a7aae294fff494d95f312968cd786d891d6bded76bc7cea5"
+DIR = f"{HOME}/Library/Caches/open-threads"
+ITEMS = f"{DIR}/andy-items.json"      # Andy's open items: [{"n":2,"topic":"...","row":"..."}]
+DB = f"{HOME}/.t3/userdata/statev2.sqlite"
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+def receipts():
+    for l in open(HANDOFF).read().split("\n"):
+        if l.startswith("Reviewed event IDs: "):
+            return json.loads(l[20:])
+    return []
+
+def link(tid, title):
+    return f"[{title}](t3-thread://v1/{tid})"
+
+def check(eid):
+    print("== 1. Event")
+    if not UUID.match(eid or ""):
+        print(f"INVALID event id {eid!r}: reply 'Nothing needs you.' and do not record it."); 
+    elif eid in receipts():
+        print("DUPLICATE: already handled. Reply 'Nothing needs you.' with the footer below. Do nothing else.")
+    else:
+        print("NEW")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    print("\n== 2. Waiting question cards (answer each by strict rule 3; read with t3_pending_request_read)")
+    rows = con.execute("""select r.thread_id, t.title, count(*), min(r.created_at) from orchestration_v2_projection_runtime_requests r
+      join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where r.status='pending' and r.kind='user_input' and r.thread_id<>?
+      and json_extract(t.payload_json,'$.settledAt') is null group by r.thread_id""", (GUARDIAN,)).fetchall()
+    if not rows: print("none")
+    for tid, title, n, since in rows:
+        print(f"- {link(tid, title)}: {n} card(s) waiting since {since[11:16]} UTC  threadId={tid}")
+    print("\n== 3. Open-thread changes since last check")
+    prev_path = f"{DIR}/latest.json"
+    prev = {r["id"]: r for r in json.load(open(prev_path))} if os.path.exists(prev_path) else {}
+    subprocess.run([f"{HOME}/.claude/bin/open-threads", "--json"], check=True)
+    cur = {r["id"]: r for r in json.load(open(prev_path))}
+    changes = []
+    for tid, r in cur.items():
+        if tid in (GUARDIAN,): continue
+        p = prev.get(tid)
+        L = link(tid, r["title"])
+        if not p: changes.append(f"NEW thread {L} ({r['verdict']})")
+        else:
+            if r["lastReply"] != p["lastReply"]:
+                changes.append(f"NEW REPLY in {L}: verdict {p['verdict']}->{r['verdict']} '{r['reason']}'. Opening: {r['bodyHead'][:220]}")
+            if r["staleRed"] and not p.get("staleRed"):
+                changes.append(f"STALE footer in {L}: says '{r['reason']}' but nothing is running. Read its finished child results and add the real result to the list.")
+    for tid in prev:
+        if tid not in cur and tid != GUARDIAN:
+            changes.append(f"SETTLED or gone: {prev[tid]['title']}")
+    print("\n".join(changes) if changes else "none")
+    print("\nIf a change is useful news or a new 'needs Andy' item, update ~/Library/Caches/open-threads/open-threads.md (plain words, a link per thread).")
+    print("\n== 4. When you've finished your edits, print the footer with:")
+    print('   ~/.claude/bin/guardian-wake footer ["Answer two waiting cards" ...]   (extra Done steps, 2-6 words each)')
+    footer([])
+
+def lead():
+    """Exact model and short name of whoever runs the guardian thread now, from T3's database."""
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        ms = json.loads(con.execute("select payload_json from orchestration_v2_projection_threads where thread_id=?", (GUARDIAN,)).fetchone()[0])["modelSelection"]
+        m = ms["model"]; eff = next((o["value"] for o in ms.get("options") or [] if o["id"] == "effort"), "")
+        names = {"claude-opus-5-5": ("Claude Opus 5.5", "Opus"), "claude-sonnet-5-5": ("Claude Sonnet 5.5", "Sonnet"),
+                 "gemini-4-argon-high": ("Gemini 4 Argon", "Gemini"), "gemini-3.8-flash-high": ("Gemini 3.8 Flash", "Flash"),
+                 "gpt-6.1-sol": ("GPT-6.1-Sol", "Sol"), "gpt-6-astra": ("GPT-6-Astra", "Astra")}
+        full, short = names.get(m, (m, m))
+        if m.startswith("gemini") and not eff: eff = m.rsplit("-", 1)[-1]
+        return f"{full} {eff}".strip(), short
+    except Exception:
+        return "model unknown", "lead"
+
+def footer(extra):
+    full, short = lead()
+    items = json.load(open(ITEMS)) if os.path.exists(ITEMS) else []
+    tier = subprocess.run([f"{HOME}/.claude/bin/claude-tier"], capture_output=True, text=True).stdout
+    usage = next((l.split("footer:",1)[1].strip() for l in tier.splitlines() if "footer:" in l), "Claude usage: unknown")
+    print("---\n")
+    print('| <span itemprop="settle-no">🔴 Don\'t settle yet</span> | watch still reports here |   |')
+    print("|---|---|--:|")
+    print(f"| Done | ~~Check the latest watch alert~~ | {short} · 1 min |")
+    for d in extra:
+        print(f"|   | ~~{d}~~ | {short} · 1 min |")
+    for it in items:
+        print(f"| Needs you | **{it['n']}. {it['topic']}** (still open) · {it['row']} |   |")
+    print(f"\n<sub>Decided for you -- · Skills -- · Written by {full} · {usage}</sub>")
+
+def lint(text):
+    bad = [w for w in re.findall(r"[A-Za-z]{28,}", text) if not w.startswith("http")]
+    return bad
+
+def record(eid, note):
+    t = open(HANDOFF).read()
+    L = t.split("\n")
+    for i, l in enumerate(L):
+        if l.startswith("Reviewed event IDs: "):
+            a = json.loads(l[20:])
+            if UUID.match(eid) and eid not in a: a.append(eid)
+            L[i] = "Reviewed event IDs: " + json.dumps(a[-200:])
+    now = datetime.datetime.now().strftime("%d %b %H:%M")
+    # newest state line goes first under '## 1. State'; keep at most 8 state lines
+    head = L.index("## 1. State")
+    body_end = next(i for i in range(head+1, len(L)) if L[i].startswith("## "))
+    lines = [x for x in L[head+1:body_end] if x.strip()]
+    lines = [f"- {now}: {note.strip()}"] + lines
+    L[head+1:body_end] = lines[:8] + [""]
+    new = "\n".join(L)
+    bad = lint(new)
+    if bad:
+        print("LINT FAIL: run-together words in the handoff (write normal sentences with spaces):", bad[:5]); sys.exit(2)
+    open(HANDOFF, "w").write(new)
+    size = len(new.encode())
+    print(f"recorded. handoff {size//1024} KB" + ("  WARNING: over 20 KB, merge old entries" if size > 20480 else ""))
+    print(subprocess.run([f"{HOME}/.claude/bin/handover", "check", "--thread", GUARDIAN], capture_output=True, text=True).stdout.strip().splitlines()[-1])
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "check": check(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "footer": footer(sys.argv[2:])
+    elif len(sys.argv) >= 4 and sys.argv[1] == "record": record(sys.argv[2], sys.argv[3])
+    else: print(__doc__); sys.exit(1)

@@ -1,0 +1,13 @@
+{
+  "outcomes": [
+    {
+      "id": "example-outcome-1",
+      "kind": "outcome",
+      "wake_when": "all_terminal",
+      "dependency_thread_ids": ["thread-example-dependency"],
+      "hold": false,
+      "hands_off": false,
+      "note": "schema example only"
+    }
+  ]
+}
