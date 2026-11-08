@@ -9,6 +9,7 @@ The scripts only read T3's local database; none of them commits, pushes or deplo
 - [x] Watcher daemon v2 (`watch/watch_v2.py`): live since 26 Oct 2026, wakes the Watch only on incidents a script can't clear
 - [x] Watch rules (`rules/guardian-attention.md`, rules 1 to 12) and the v2 add-on (`watch/GUARDIAN-PROMPT.md`)
 - [x] Publication watch (`watch/publication_watch.py`): live since 7 Nov 2026, every 30 minutes
+- [ ] Needs you advice (`bin/needs-you-advice`, `advice/`): a trial until 21 Nov 2026, then Andy keeps or stops it
 - [ ] Daily stale-thread pass (`stale/stale_sweep.py`): a trial until 14 Nov 2026, then Andy decides whether to keep it
 - [x] This repo mirrors the live copies, checked by `scripts/check.sh`
 - [ ] Known test failures: see [Tests](#tests)
@@ -33,7 +34,7 @@ T3's database (read-only)
 2. **The webhook** is a T3 scheduled task. It wakes the Watch thread with the incident payload. Its URL carries a secret and lives only in T3 and in the local `live/config.json`.
 3. **The Watch** handles each wake by the rules in `rules/guardian-attention.md`. `bin/guardian-wake check` does the mechanical part (duplicates, waiting cards, thread changes), the model does the judgment, `bin/guardian-wake record` saves a receipt, and `bin/guardian-wake footer` prints Andy's list from `andy-items.json`: each item folds to one line with the day it was first left unanswered and any due date, and opens to the item's text plus a second fold with ranked options from the Grok and Gemini advisors (`andy-items-advice.json`), when there are some.
 4. **The publication watch** compares local git repos and Netlify sites with what's published, and wakes the Watch only when its findings change.
-5. **The daily stale-thread pass** lists threads idle for 48 hours or more, writes an extract of each, and lets the Watch settle the ones with nothing left for Andy, after putting anything unanswered on his list.
+5. **The daily stale-thread pass** lists threads idle for 12 hours or more (48 until Andy changed it on 8 Nov 2026), writes an extract of each, and lets the Watch settle the ones with nothing left for Andy, after putting anything unanswered on his list.
 
 The design and its history are in [docs/DESIGN.md](docs/DESIGN.md); the decisions behind it, in Andy's words, are in [docs/DECISIONS.md](docs/DECISIONS.md).
 
@@ -50,6 +51,8 @@ The design and its history are in [docs/DESIGN.md](docs/DESIGN.md); the decision
 | `watch/config.example.json`, `watch/open-outcomes.example.json` | the shape of the private config and outcome list | same folder | tests |
 | `bin/guardian-wake` | the mechanical part of each wake | `~/.claude/bin/` | the Watch thread |
 | `bin/open-threads` | lists unsettled top-level threads with their last verdict | `~/.claude/bin/` | `guardian-wake`, the Watch |
+| `bin/needs-you-advice` | the advice trial: finds items without current advice, makes job folders, checks quotes and numbers, merges both advisors' rankings, the kill test | `~/.claude/bin/` | the Grok advice thread; the Watch (`dropped`) |
+| `advice/LEAD.md`, `advice/BRIEF-R1.md`, `advice/BRIEF-R2.md` | the Grok lead's procedure and the two rounds' briefs | `~/Library/Caches/needs-you-advice/` | the Grok advice thread, Gemini |
 | `rules/guardian-attention.md` | the Watch's binding rules | `~/.claude/rules-reference/` | the Watch thread |
 | `stale/stale_sweep.py` | the daily stale-thread pass | `~/Library/Caches/stale-thread-triage/` | the Watch's daily scheduled run |
 | `docs/DESIGN.md` | design notes for v2 | `~/Library/Caches/thread-watch-v2/` | reading |

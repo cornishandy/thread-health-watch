@@ -1,6 +1,10 @@
 .gitignore
 README.md
+advice/BRIEF-R1.md
+advice/BRIEF-R2.md
+advice/LEAD.md
 bin/guardian-wake
+bin/needs-you-advice
 bin/open-threads
 docs/DECISIONS.md
 docs/DESIGN.md

@@ -8,10 +8,10 @@
   guardian-wake record <event_id> "<one plain sentence>"   save receipt + state line, lint handoff
 
 The guardian (any model) runs `check`, does the judgment steps it prints, then `record`."""
-import json, os, re, sqlite3, subprocess, sys, datetime
+import hashlib, json, os, re, sqlite3, subprocess, sys, datetime
 HOME = os.path.expanduser("~")
 HANDOFF = f"{HOME}/Library/Caches/handoffs/2026-10-21-audit-all-t3-threads-for-dead-ends-25824f7b/HANDOFF-25824f7b.md"
-GUARDIAN = "mcp:launch:367b6f5597bc3de526ed77911dd3d0fe36b03e18b1de4667e065d4a92ed05c0d"
+GUARDIAN = "mcp:launch:430565ca120f865fdd2153b7c33ace065eab66edb8200219182288bd4937672e"
 DIR = f"{HOME}/Library/Caches/open-threads"
 ITEMS = f"{DIR}/andy-items.json"      # Andy's open items: [{"n":2,"topic":"...","row":"...","since":"2026-11-07","due":null}]
 ADVICE = f"{DIR}/andy-items-advice.json"  # ranked options from the Grok + Gemini advisors, by item number
@@ -176,10 +176,17 @@ def advice_fold(adv):
         lines.append(f"<sub>{adv['by']}</sub>")
     return f"<details><summary>{head}</summary>{'<br>'.join(lines)}</details>"
 
+def row_hash(it):
+    """Same function as in needs-you-advice: advice is current while the item's topic and text are unchanged."""
+    return hashlib.sha256(json.dumps([it.get("topic"), it.get("row")], ensure_ascii=False).encode()).hexdigest()[:12]
+
 def needs_row(it, first_seen, adv, today):
     """A Needs you row folded to one line: click it for the row's text and the advisors' fold."""
     if adv and adv.get("topic") not in (None, it["topic"]):
         adv = None  # advice written for a different item that once had this number
+    if adv and adv.get("row_hash") not in (None, row_hash(it)):
+        # the item's text changed after the advice was written: still shown, marked (the trial rewrites it)
+        adv = dict(adv, finding=" ".join(filter(None, [f"*Written before this item's text last changed ({adv.get('asOf', 'date unknown')}).*", adv.get("finding")])))
     summary = f"**{it['n']}. {it['topic']}** · {when(it, first_seen, today)}"
     note = f"*{it['due_note'][0].upper()}{it['due_note'][1:]}.* " if it.get("due_note") else ""
     return cell(f"<details><summary>{summary}</summary>{note}{it['row']}{advice_fold(adv) if adv else ''}</details>")

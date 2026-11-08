@@ -40,7 +40,7 @@ def run(path, *argv):
 def assess(path, tid):
     con = sqlite3.connect(path)
     p = json.loads(con.execute("select payload_json from orchestration_v2_projection_threads where thread_id=?", (tid,)).fetchone()[0])
-    return ss.assess(con, tid, p, NOW, 48)
+    return ss.assess(con, tid, p, NOW, 12)
 
 fails = 0
 def check(name, cond):
@@ -96,10 +96,21 @@ check("a run reopening a thread is not a hand unsettle", not any("curly" in h fo
 # 6. two threads with the same title get separate extracts (full main() run on the fixture DB)
 thread(c, "rev1", title="Review"); msg(c, "rev1", t(0), "user", "a"); msg(c, "rev1", t(1), "assistant", "Approve plan 1?")
 thread(c, "rev2", title="Review"); msg(c, "rev2", t(0), "user", "b"); msg(c, "rev2", t(1), "assistant", "Approve plan 2?"); c.commit()
+# The real default run includes a thread idle 13 h, but not one idle 11 h.
+for tid, idle_hours in (("idle-13h", 13), ("idle-11h", 11)):
+    recent = (NOW - timedelta(hours=idle_hours)).isoformat()
+    thread(c, tid)
+    payload = json.loads(c.execute("select payload_json from orchestration_v2_projection_threads where thread_id=?", (tid,)).fetchone()[0])
+    payload.update(createdAt=recent, updatedAt=recent)
+    c.execute("update orchestration_v2_projection_threads set payload_json=? where thread_id=?", (json.dumps(payload), tid))
+    msg(c, tid, recent, "user", "Finish the task.")
+    msg(c, tid, recent, "assistant", "Finished.")
+c.commit()
 ss.repo_state = lambda name: None; ss.pr_state = lambda r, n: "x"
 sys.argv = ["stale_sweep.py"]; ss.main()
 day = os.path.join(ss.BASE, "daily", datetime.now().strftime("%Y-%m-%d"))
 s = json.load(open(os.path.join(day, "summary.json")))
+check("default cutoff includes 13 h and excludes 11 h", "idle-13h" in {x["threadId"] for x in s["candidates"]} and "idle-11h" not in {x["threadId"] for x in s["candidates"]})
 paths = [x["extract"] for x in s["candidates"] if x["title"] == "Review"]
 check("same titles get different extract files", len(paths) == 2 and len(set(paths)) == 2)
 

@@ -21,7 +21,7 @@ This is an add-on to `~/.claude/rules-reference/guardian-attention.md`. That fil
 4. Run `guardian-wake record`, then reply under rule 1 ("Nothing needs you." plus the footer when nothing new needs Andy).
 
 ## Never
-- Start, cancel, settle, steer or edit other threads' work. Answering cards under rule 3 and keeping the list are the only actions. Exception: the daily stale-thread pass in rule 12 of guardian-attention.md (trial to 14 Nov 2026, Andy's 7 Nov pick) settles threads idle 48 h or more.
+- Start, cancel, settle, steer or edit other threads' work. Answering cards under rule 3 and keeping the list are the only actions. Exception: the daily stale-thread pass in rule 12 of guardian-attention.md (trial to 14 Nov 2026, Andy's 7 Nov pick) settles threads idle 12 h or more (Andy changed the cutoff on 8 Nov 2026).
 - Print webhook URLs, tokens, IDs or reason codes in Andy-facing text.
 
 ## Git and Netlify publication monitoring (Andy, 7 Nov 2026)

@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Needs you advice trial: Grok and Gemini write a ranked-advice fold for each new item on Andy's list.
+
+A dated trial (Andy, 7 Nov 2026, "Yes, do it"): from Sat 7 Nov to the end of Sat 21 Nov 2026, then Andy
+keeps or stops it. It stops early if Andy drops an item whose advice this trial wrote and whose
+top-ranked option wasn't to drop it. No Claude or Codex: a T3 scheduled task wakes a Grok 4.7 (xhigh)
+thread, which runs this script, works one side itself and has Gemini 4 Argon High work the other.
+The script does the bookkeeping, the quote and number checks and the merge, so no model has to.
+
+  needs-you-advice status                 trial state, dates, pending items
+  needs-you-advice pending                NONE | PENDING 9,12 | BUSY <job> | STOPPED … | ENDED …   (first word)
+  needs-you-advice prep [--test N]        make a job folder for the pending items (or item N as a test) and lock
+  needs-you-advice task gemini r1|r2 JOB  print the delegate_task text for Gemini's round
+  needs-you-advice wait JOB FILE [MIN]    block up to MIN minutes (default 9) until FILE is valid JSON
+  needs-you-advice check JOB r1|r2        verify every quoted string against its cited source; writes JOB/check-rN.json
+  needs-you-advice merge JOB [--dry]      merge both round-2 files into andy-items-advice.json (--dry: JOB only)
+  needs-you-advice fail JOB "reason"      give up on this job: count an attempt per item, unlock
+  needs-you-advice dropped N              the Watch runs this before removing item N because Andy dropped it
+  needs-you-advice keep | stop            Andy's answer at the trial's end (or any time)
+  needs-you-advice register TASK THREAD   record the scheduled task id and its home thread id
+  needs-you-advice backfill               stamp today's hand-made advice with its item's current wording
+"""
+import datetime, glob, hashlib, json, os, re, sqlite3, sys, time
+
+HOME = os.path.expanduser("~")
+LIST_DIR = f"{HOME}/Library/Caches/open-threads"
+ITEMS = f"{LIST_DIR}/andy-items.json"
+ADVICE = f"{LIST_DIR}/andy-items-advice.json"
+TRIAL = f"{HOME}/Library/Caches/needs-you-advice"
+STATE = f"{TRIAL}/trial.json"
+LOCK = f"{TRIAL}/lock.json"
+DB = f"{HOME}/.t3/userdata/statev2.sqlite"
+START, UNTIL = "2026-11-07", "2026-11-21"   # last day new advice is written, unless Andy says keep
+LOCK_HOURS = 3        # a job older than this is treated as dead
+MAX_ITEMS = 4         # items per job
+MAX_ATTEMPTS = 2      # failed jobs per item wording before the trial skips it
+STRENGTHS = ("strong", "moderate", "lean")
+BY = ("Ranked by Grok 4.7 xhigh and Gemini 4 Argon High, each auditing the other's claims; quotes and numbers "
+      "checked by script, not by Claude (trial until 21 Nov)")
+
+
+def row_hash(it):
+    """Same function as in guardian-wake: advice is current while the item's topic and text are unchanged."""
+    return hashlib.sha256(json.dumps([it.get("topic"), it.get("row")], ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+def load(path, default):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def state():
+    s = load(STATE, {})
+    s.setdefault("state", "on")       # on | stopped | kept
+    s.setdefault("start", START)
+    s.setdefault("until", UNTIL)
+    s.setdefault("attempts", {})
+    s.setdefault("log", [])
+    return s
+
+
+def log(s, msg):
+    s["log"] = (s["log"] + [f"{datetime.datetime.now():%Y-%m-%d %H:%M} {msg}"])[-60:]
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def ended(s):
+    return s["state"] == "on" and s.get("until") and today() > s["until"]
+
+
+def lock_info():
+    lk = load(LOCK, None)
+    if lk and time.time() - lk.get("t", 0) < LOCK_HOURS * 3600:
+        return lk
+    return None
+
+
+def items():
+    return load(ITEMS, [])
+
+
+def needing(s):
+    """Items with no current trial-era advice: none at all, advice for another topic, or an older wording."""
+    adv = load(ADVICE, {})
+    out = []
+    for it in items():
+        a = adv.get(str(it["n"]))
+        h = row_hash(it)
+        if a and a.get("topic") == it["topic"] and a.get("row_hash", h) == h:
+            continue
+        if s["attempts"].get(f"{it['n']}:{h}", 0) >= MAX_ATTEMPTS:
+            continue
+        out.append(it)
+    return out
+
+
+def cmd_pending():
+    s = state()
+    task = s.get("task_id", "unknown")
+    if s["state"] == "stopped":
+        print(f"STOPPED {s.get('stopped_reason', '')} · scheduled task {task}: disable it (schedule_task enabled=false)")
+        return
+    if ended(s):
+        print(f"ENDED on {s['until']} (Andy decides keep or stop) · scheduled task {task}: disable it (schedule_task enabled=false)")
+        return
+    lk = lock_info()
+    if lk:
+        print(f"BUSY {lk['job']}")
+        return
+    need = needing(s)
+    print(f"PENDING {','.join(str(i['n']) for i in need[:MAX_ITEMS])}" if need else "NONE")
+
+
+def cmd_status():
+    s = state()
+    print(f"trial: {s['state']}, {s['start']} to {s['until'] or 'no end (kept)'}" + (" — ENDED, awaiting Andy" if ended(s) else ""))
+    if s.get("stopped_reason"):
+        print("stopped:", s["stopped_reason"])
+    print("scheduled task:", s.get("task_id", "not recorded"), "· home thread:", s.get("home_thread", "not recorded"))
+    lk = lock_info()
+    print("running job:", lk["job"] if lk else "none")
+    print("pending:", ", ".join(f"{i['n']} {i['topic']}" for i in needing(s)) or "none")
+    for l in s["log"][-8:]:
+        print("  ", l)
+
+
+# ---------- job folder ----------
+
+THREAD_LINK = re.compile(r"t3-thread://v[12]/(?:[0-9a-f-]{36}/)?([A-Za-z0-9:_.-]+)")
+SYSP = ("Delegated task", "Background command", "You are continuing", "<task-notification", "Continue where", "Andy answered at")
+
+
+def loc(ts):
+    return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%a %d %b %Y %I:%M %p %Z")
+
+
+def thread_tail(con, tid, path):
+    """Andy's last three real messages and the thread's last six, long ones cut in the middle."""
+    row = con.execute("select title from orchestration_v2_projection_threads where thread_id=?", (tid,)).fetchone()
+    if not row:
+        return False
+    msgs = con.execute("select created_at, role, json_extract(payload_json,'$.text') from orchestration_v2_projection_messages "
+                       "where thread_id=? order by created_at", (tid,)).fetchall()
+    andy = [m for m in msgs if m[1] == "user" and not (m[2] or "").lstrip().startswith(SYSP)]
+    with open(path, "w") as f:
+        f.write(f"# {row[0]}\nthreadId: {tid}\nmessages: {len(msgs)}; last real Andy message: {loc(andy[-1][0]) if andy else 'none'}\n\n")
+        for c, r, x in andy[-3:]:
+            f.write(f"## ANDY (real message) {loc(c)} [{c}]\n{(x or '')[:2500]}\n\n")
+        for c, r, x in msgs[-6:]:
+            x = x or ""
+            body = x if len(x) <= 7000 else x[:3500] + "\n\n[... CUT ...]\n\n" + x[-3500:]
+            f.write(f"## {r.upper()} {loc(c)} [{c}]\n{body}\n\n")
+    return True
+
+
+def cmd_prep(args):
+    s = state()
+    test = None
+    if args[:1] == ["--test"]:
+        test = int(args[1])
+    elif s["state"] == "stopped" or ended(s):
+        sys.exit("trial not running: " + ("stopped" if s["state"] == "stopped" else "ended"))
+    if lock_info():
+        sys.exit(f"BUSY {lock_info()['job']}")
+    picked = [i for i in items() if i["n"] == test] if test is not None else needing(s)[:MAX_ITEMS]
+    if not picked:
+        sys.exit("nothing to do")
+    job = f"{TRIAL}/jobs/{datetime.datetime.now():%Y%m%d-%H%M}" + ("-test" if test is not None else "")
+    os.makedirs(f"{job}/threads", exist_ok=True)
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    out = []
+    for it in picked:
+        tails = []
+        for tid in dict.fromkeys(THREAD_LINK.findall(it["row"])):
+            p = f"{job}/threads/item{it['n']}-{re.sub(r'[^A-Za-z0-9]', '', tid)[-8:]}.md"
+            if thread_tail(con, tid, p):
+                tails.append(p)
+        out.append({**it, "row_hash": row_hash(it), "thread_tails": tails})
+    save(f"{job}/items.json", {"test": test is not None, "made": datetime.datetime.now().isoformat(timespec="minutes"), "items": out})
+    save(LOCK, {"job": job, "t": time.time(), "items": [i["n"] for i in picked]})
+    log(s, f"prep {os.path.basename(job)} items {[i['n'] for i in picked]}")
+    save(STATE, s)
+    print(job)
+
+
+def cmd_task(who, rnd, job):
+    """The whole brief for Gemini, so the Grok lead never has to compose it."""
+    if who != "gemini" or rnd not in ("r1", "r2"):
+        sys.exit("usage: task gemini r1|r2 JOB")
+    brief = f"{TRIAL}/BRIEF-R1.md" if rnd == "r1" else f"{TRIAL}/BRIEF-R2.md"
+    print(f"""You are the Gemini advisor (Gemini 4 Argon High) in the Needs you advice trial. Work at full depth: Andy wants your usage spent on thorough, bold, checked advice.
+
+Read these files first, in full, and follow them exactly:
+1. {brief} (your instructions for this round; they bind you)
+2. {job}/items.json (the items, with their source thread excerpts listed under thread_tails)
+{"3. " + job + "/r1-grok.json, " + job + "/r1-gemini.json, " + job + "/options-canonical.json and " + job + "/check-r1.json (round 1 and the shared option list)" if rnd == "r2" else ""}
+
+Write exactly one file, {job}/{rnd}-gemini.json, then reply with at most 300 words.
+Hard limits: read-only everywhere except that one file; never edit Andy's list or any repo; no messages to other threads, no answering cards, no merges, pushes, purchases, emails or sign-ups; no subagents; you write no code and judge no code, diffs or test results; the T3 database only through sqlite3 "file:$HOME/.t3/userdata/statev2.sqlite?mode=ro". Every quote you write must be copied character for character from the source you cite: a script checks every quoted string, and a quote it can't find voids that rationale.
+End your reply with one line: Model/effort: …; skills used: …; agents: none; needs Andy: none.""")
+
+
+def cmd_wait(job, name, minutes=9):
+    path = f"{job}/{name}"
+    end = time.time() + float(minutes) * 60
+    while time.time() < end:
+        if os.path.exists(path):
+            try:
+                json.load(open(path))
+                print(f"READY {path}")
+                return
+            except ValueError:
+                pass
+        time.sleep(20)
+    print(f"STILL WAITING for {path} (run wait again; after about 75 minutes in all, check the child's status)")
+
+
+# ---------- checks ----------
+
+QUOTE = re.compile(r"[\"“]([^\"“”]{12,}?)[\"”]")
+LOCAL = re.compile(r"((?:~|/" + "Users" + r"/[^/\s]+)/[^\s:\"'`)(,;]+)")  # a home path, spelt in pieces for the repo's leak check
+
+
+def norm(t):
+    t = t.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').replace("—", "-").replace("–", "-")
+    return " ".join(t.split()).lower()
+
+
+_db_cache = {}
+
+
+def in_db(q):
+    if q in _db_cache:
+        return _db_cache[q]
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        hit = con.execute("select 1 from orchestration_v2_projection_messages where instr(json_extract(payload_json,'$.text'), ?) > 0 limit 1",
+                          (q,)).fetchone() is not None
+    except sqlite3.Error:
+        hit = False
+    _db_cache[q] = hit
+    return hit
+
+
+def file_text(p):
+    p = os.path.expanduser(p.rstrip("."))
+    try:
+        if os.path.isfile(p) and os.path.getsize(p) < 5_000_000:
+            return norm(open(p, errors="replace").read())
+    except OSError:
+        pass
+    return None
+
+
+def check_string(s):
+    """Every quoted string must appear in a local file the same text cites, or in a T3 message. Web-only quotes pass, marked."""
+    bad, web = [], []
+    files = [t for t in (file_text(p) for p in LOCAL.findall(s)) if t]
+    for q in QUOTE.findall(s):
+        nq = norm(q).strip(" .…")
+        if any(nq in t for t in files):
+            continue
+        core = q.strip(" .…")
+        # a quote found in no cited file still passes if it's in a real T3 message: the aim is catching invented
+        # quotes, and stricter attribution dropped real ones in the 7 Nov test ("the same message says …")
+        if in_db(core) or in_db(core.replace("'", "’")):
+            continue
+        if "http" in s and not files:
+            web.append(q)
+            continue
+        bad.append(q)
+    return bad, web
+
+
+def walk(o, path=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from walk(v, f"{path}.{k}")
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            yield from walk(v, f"{path}[{i}]")
+    elif isinstance(o, str):
+        yield path, o
+
+
+def cmd_check(job, rnd):
+    res = {}
+    for who in ("grok", "gemini"):
+        d = load(f"{job}/{rnd}-{who}.json", None)
+        if d is None:
+            res[who] = {"error": "file missing or not JSON"}
+            continue
+        bad, web = [], []
+        for path, s in walk(d):
+            b, w = check_string(s)
+            bad += [{"where": path, "quote": q} for q in b]
+            web += [{"where": path, "quote": q} for q in w]
+        res[who] = {"quotes_not_found": bad, "web_quotes_unchecked": len(web)}
+    save(f"{job}/check-{rnd}.json", res)
+    for who, r in res.items():
+        print(f"{who}: " + (r.get("error") or f"{len(r['quotes_not_found'])} quote(s) not found in their cited source, "
+                                              f"{r['web_quotes_unchecked']} web quote(s) unchecked"))
+        for b in r.get("quotes_not_found", [])[:10]:
+            print(f"   {b['where']}: \"{b['quote'][:100]}\"")
+    print(f"wrote {job}/check-{rnd}.json")
+
+
+# ---------- merge ----------
+
+ORD = {1: "1st", 2: "2nd", 3: "3rd"}
+NUM = re.compile(r"\$?\d[\d,.:]*%?")
+
+
+def plain_ok(plain, source):
+    """A plain rationale may not quote anything, and every number in it must appear in the advisor's own long text."""
+    if not plain or not isinstance(plain, str):
+        return False, "missing"
+    if re.search(r"[\"“”]", plain):
+        return False, "contains a quote"
+    if len(plain.split()) > 45:
+        return False, "over 45 words"
+    src = norm(source)
+    for n in NUM.findall(plain):
+        n2 = n.rstrip(".,:")
+        if n2 and not re.search(r"(?<![\d.,])" + re.escape(norm(n2)) + r"(?![\d,]|\.\d)", src):
+            return False, f"number {n2} not in its own evidence"
+    return True, ""
+
+
+def cmd_merge(job, dry=False):
+    meta = load(f"{job}/items.json", None)
+    canon = load(f"{job}/options-canonical.json", None)
+    r2 = {w: load(f"{job}/r2-{w}.json", None) for w in ("grok", "gemini")}
+    r1 = {w: load(f"{job}/r1-{w}.json", {}) for w in ("grok", "gemini")}
+    if not meta or not canon or None in r2.values():
+        sys.exit("missing items.json, options-canonical.json or an r2 file")
+    if not os.path.exists(f"{job}/check-r2.json"):
+        cmd_check(job, "r2")
+    chk = load(f"{job}/check-r2.json", {})
+    badq = {w: {b["where"] for b in chk.get(w, {}).get("quotes_not_found", [])} for w in r2}
+    adv = load(ADVICE, {})
+    live = {str(i["n"]): i for i in items()}
+    out, report = {}, []
+    for it in meta["items"]:
+        n = str(it["n"])
+        c = (canon.get("items") or {}).get(n) or {}
+        per, notes = {}, []
+        for w in r2:
+            entry = next(((k, x) for k, x in enumerate(r2[w].get("items", [])) if str(x.get("n")) == n), (None, None))
+            per[w] = entry
+        rows = []
+        ids = list((c.get("options") or {}).keys())
+        for w in r2:
+            k, x = per[w]
+            for r in (x or {}).get("ranking", []):
+                if r.get("id") not in ids and str(r.get("id", "")).startswith(n):
+                    ids.append(r["id"])
+        for oid in ids:
+            vote, text = {}, {}
+            for w, name in (("grok", "Grok"), ("gemini", "Gemini")):
+                k, x = per[w]
+                rk = next(((j, r) for j, r in enumerate((x or {}).get("ranking", [])) if r.get("id") == oid), (None, None))
+                j, r = rk
+                if not r:
+                    continue
+                st = str(r.get("strength", "")).lower()
+                if st not in STRENGTHS:
+                    notes.append(f"{name} used \"{st}\" outside the strong/moderate/lean scale; shown as lean")
+                    st = "lean"
+                vote[w] = (int(r.get("rank", 99)), st, r.get("confidence"))
+                src = json.dumps([x, r1[w]], ensure_ascii=False, default=str)
+                src = re.sub(r'"plain": "(?:[^"\\]|\\.)*"', "", src)  # a plain text can't vouch for its own numbers
+                ok, why = plain_ok(r.get("plain"), src)
+                where_bad = any(p.startswith(f".items[{k}].ranking[{j}]") for p in badq[w])
+                if where_bad:
+                    ok, why = False, "a quote didn't match its source"
+                if ok:
+                    text[name] = r["plain"].strip()
+                else:
+                    notes.append(f"{name}'s rationale for {oid} left out ({why})")
+            if not vote:
+                continue
+            o = c.get("options", {}).get(oid) or next((((per[w][1] or {}).get("new_option") or {}) for w in per
+                                                        if ((per[w][1] or {}).get("new_option") or {}).get("id") == oid), {})
+            rows.append({"id": oid, "label": o.get("label", oid), "reply": o.get("reply"), "drop": bool(o.get("drop")),
+                         "_score": sum(v[0] for v in vote.values()) + (0 if len(vote) == 2 else 50),
+                         "_conf": -sum((v[2] or 0) for v in vote.values()), "_vote": vote,
+                         "rationale": " ".join(f"{k}: {v}" for k, v in text.items())})
+        if not rows:
+            report.append(f"item {n}: no rankings, skipped")
+            continue
+        rows.sort(key=lambda r: (r["_score"], r["_conf"]))
+        tops = {w: min((r for r in rows if w in r["_vote"]), key=lambda r: r["_vote"][w][0], default={}).get("id") for w in r2}
+        lab = {r["id"]: r["label"] for r in rows}
+        agree = "both pick it" if tops["grok"] == tops["gemini"] else \
+            f"split: Grok picks {lab.get(tops['grok'], '?')}, Gemini picks {lab.get(tops['gemini'], '?')}"
+        opts = []
+        for r in rows:
+            o = {"id": r["id"], "label": r["label"], "reply": r["reply"]}
+            if r["drop"]:
+                o["drop"] = True
+            for w, name in (("grok", "grok"), ("gemini", "gemini")):
+                v = r["_vote"].get(w)
+                o[name] = (f"{ORD.get(v[0], str(v[0]) + 'th')} {v[1]}" + (f" {v[2]}%" if v[0] == 1 and v[2] is not None else "")) if v else None
+            o["rationale"] = r["rationale"]
+            opts.append(o)
+        finding = c.get("finding")
+        fv = str(((per["gemini"][1] or {}).get("finding_verdict") or "")).lower()
+        if finding and fv != "true":
+            notes.append("Grok's finding left out (Gemini didn't confirm it)")
+            finding = None
+        entry = {"topic": it["topic"], "row_hash": it["row_hash"], "agreement": agree, "finding": finding, "options": opts,
+                 "note": "; ".join(dict.fromkeys(notes)) + "." if notes else None, "by": BY, "asOf": today(), "trial": True,
+                 "job": os.path.basename(job)}
+        out[n] = entry
+        stale = live.get(n) is None or row_hash(live[n]) != it["row_hash"]
+        report.append(f"item {n} {it['topic']}: {agree}; top {opts[0]['label']}" + (" (item changed or gone since prep: not written)" if stale else ""))
+        if stale:
+            out.pop(n)
+    save(f"{job}/advice-merged.json", out)
+    if not dry and not meta.get("test"):
+        adv.update(out)
+        save(ADVICE, adv)
+        report.append(f"wrote {len(out)} entr{'y' if len(out) == 1 else 'ies'} to {ADVICE}")
+    else:
+        report.append(f"dry run: {job}/advice-merged.json only")
+    s = state()
+    log(s, f"merge {os.path.basename(job)}: {', '.join(out) or 'nothing'}" + (" (dry)" if dry or meta.get("test") else ""))
+    save(STATE, s)
+    lk = load(LOCK, None)
+    if lk and lk.get("job") == job:
+        os.remove(LOCK)
+    print("\n".join(report))
+
+
+def cmd_fail(job, reason):
+    s = state()
+    meta = load(f"{job}/items.json", {"items": []})
+    if not meta.get("test"):
+        for it in meta["items"]:
+            k = f"{it['n']}:{it['row_hash']}"
+            s["attempts"][k] = s["attempts"].get(k, 0) + 1
+    log(s, f"fail {os.path.basename(job)}: {reason}")
+    save(STATE, s)
+    lk = load(LOCK, None)
+    if lk and lk.get("job") == job:
+        os.remove(LOCK)
+    print("recorded; unlocked")
+
+
+# ---------- kill test and end ----------
+
+def cmd_dropped(n):
+    """Andy dropped item n. The trial stops when the advice it wrote for n didn't rank dropping first."""
+    s = state()
+    a = load(ADVICE, {}).get(str(n))
+    it = next((i for i in items() if i["n"] == int(n)), None)
+    if not a or not a.get("trial") or (it and a.get("topic") != it["topic"]):
+        print(f"item {n}: no advice from this trial, so the kill test doesn't apply")
+        return
+    top = (a.get("options") or [{}])[0]
+    if top.get("drop") or "drop" in str(top.get("reply") or "").lower():
+        log(s, f"item {n} dropped, as the advisors recommended")
+        save(STATE, s)
+        print(f"item {n}: the advisors' first pick was to drop it, so the trial continues")
+        return
+    if s["state"] != "on":
+        print(f"item {n}: trial already {s['state']}")
+        return
+    s["state"] = "stopped"
+    s["stopped_reason"] = f"{today()}: Andy dropped item {n} ({a['topic']}); the advisors' first pick was \"{top.get('label')}\""
+    log(s, "kill test: " + s["stopped_reason"])
+    save(STATE, s)
+    print(f"TRIAL STOPPED: Andy dropped item {n} ({a['topic']}), which the advisors had ranked "
+          f"\"{top.get('label')}\" first. Tell Andy once, as a Done step: \"Stop the advice trial (you dropped {n})\".")
+
+
+def cmd_set(what):
+    s = state()
+    if what == "keep":
+        s["state"], s["until"] = "kept", None
+        s.pop("stopped_reason", None)
+    else:
+        s["state"] = "stopped"
+        s["stopped_reason"] = f"{today()}: Andy chose stop"
+    log(s, f"Andy: {what}")
+    save(STATE, s)
+    print(f"trial {s['state']}" + (" · re-enable the scheduled task if it was disabled" if what == "keep" else
+                                    " · disable its scheduled task"))
+
+
+def cmd_backfill():
+    adv = load(ADVICE, {})
+    live = {str(i["n"]): i for i in items()}
+    done = []
+    for n, a in adv.items():
+        if "row_hash" not in a and n in live and a.get("topic") == live[n]["topic"]:
+            a["row_hash"] = row_hash(live[n])
+            done.append(n)
+    save(ADVICE, adv)
+    print("stamped:", ", ".join(done) or "none")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    c = a[0] if a else ""
+    if c == "status": cmd_status()
+    elif c == "pending": cmd_pending()
+    elif c == "prep": cmd_prep(a[1:])
+    elif c == "task" and len(a) == 4: cmd_task(a[1], a[2], a[3].rstrip("/"))
+    elif c == "wait" and len(a) >= 3: cmd_wait(a[1].rstrip("/"), a[2], *(a[3:4]))
+    elif c == "check" and len(a) == 3: cmd_check(a[1].rstrip("/"), a[2])
+    elif c == "merge" and len(a) >= 2: cmd_merge(a[1].rstrip("/"), "--dry" in a)
+    elif c == "fail" and len(a) == 3: cmd_fail(a[1].rstrip("/"), a[2])
+    elif c == "dropped" and len(a) == 2: cmd_dropped(a[1])
+    elif c in ("keep", "stop"): cmd_set(c)
+    elif c == "backfill": cmd_backfill()
+    elif c == "register" and len(a) == 3:
+        s = state(); s["task_id"], s["home_thread"] = a[1], a[2]; log(s, f"registered task {a[1]} in thread {a[2]}"); save(STATE, s); print("registered")
+    else:
+        print(__doc__)
+        sys.exit(1)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Daily stale-thread pass for the Thread Health Watch (trial to 14 Nov 2026; Andy picked it 7 Nov 2026).
 
-Finds Andy's unsettled top-level threads idle for 48 h or more, writes one extract per thread (Andy's messages,
+Finds Andy's unsettled top-level threads idle for 12 h or more, writes one extract per thread (Andy's messages,
 agent relays, and every reply after his last message), checks the git repos and GitHub PRs those replies name,
 and says for each thread whether the Watch may settle it. Read-only on T3's database.
 
@@ -170,7 +170,7 @@ def main():
     test_ids = sys.argv[sys.argv.index("--test-ids") + 1:] if "--test-ids" in sys.argv else None
     if date.today() > TRIAL_END and not test_ids:
         print("TRIAL ENDED (14 Nov 2026): don't sweep; ask Andy keep or stop"); return
-    hours = 0 if test_ids else (float(sys.argv[sys.argv.index("--min-idle-hours") + 1]) if "--min-idle-hours" in sys.argv else 48)
+    hours = 0 if test_ids else (float(sys.argv[sys.argv.index("--min-idle-hours") + 1]) if "--min-idle-hours" in sys.argv else 12)
     now = datetime.now(timezone.utc)
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     out_dir = f"{BASE}/daily/" + ("test" if test_ids else datetime.now().strftime("%Y-%m-%d"))

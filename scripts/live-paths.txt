@@ -13,6 +13,10 @@ watch/GUARDIAN-PROMPT.md         ~/Library/Caches/thread-watch-v2/GUARDIAN-PROMP
 docs/DESIGN.md                   ~/Library/Caches/thread-watch-v2/DESIGN.md
 bin/guardian-wake                ~/.claude/bin/guardian-wake
 bin/open-threads                 ~/.claude/bin/open-threads
+bin/needs-you-advice             ~/.claude/bin/needs-you-advice
+advice/LEAD.md                   ~/Library/Caches/needs-you-advice/LEAD.md
+advice/BRIEF-R1.md               ~/Library/Caches/needs-you-advice/BRIEF-R1.md
+advice/BRIEF-R2.md               ~/Library/Caches/needs-you-advice/BRIEF-R2.md
 rules/guardian-attention.md      ~/.claude/rules-reference/guardian-attention.md
 stale/stale_sweep.py             ~/Library/Caches/stale-thread-triage/stale_sweep.py
 stale/test_stale_sweep.py        ~/Library/Caches/stale-thread-triage/test_stale_sweep.py

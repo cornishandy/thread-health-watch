@@ -9,6 +9,7 @@ For the next thread that works on the Watch from this project. Keep it short and
 - The daily stale-thread pass is a trial until 14 Nov 2026 (rule 12). After that the Watch asks Andy to keep or stop it.
 - Two tests in `watch/test_watch_v2.py` fail on the live copy because they expect at least 8 unsettled threads (see README, Tests). Not fixed; it's test data, not daemon behaviour.
 - No license yet: Andy hasn't chosen one.
+- The Needs you advice trial runs until 21 Nov 2026 (`needs-you-advice status`). Its hourly T3 scheduled task lives in its own Grok thread, "Needs you advice trial", in this project; it doesn't move with the Watch's handovers. Job folders, `trial.json` and the advice file are private and stay out of the repo.
 
 ## How to change something
 
