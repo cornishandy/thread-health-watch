@@ -43,6 +43,7 @@ The design and its history are in [docs/DESIGN.md](docs/DESIGN.md); the decision
 | Repo path | What it does | Live copy (the one that runs) | Run by |
 |---|---|---|---|
 | `watch/watch_v2.py` | the watcher daemon: scan, incidents, delivery | `~/Library/Caches/thread-watch-v2/` | launchd (`launchd/t3-thread-guardian.plist.template`) |
+| `watch/board.py` | the board and the 3 PM and 9 PM digests; `digest-state.json` is shared with `bin/guardian-wake` under a file lock | same folder | `watch_v2.py` after each scan |
 | `watch/triage.py` | the incident rules, pure functions | same folder | `watch_v2.py` |
 | `watch/metrics.py` | daily counts of wakes and incidents | same folder | by hand |
 | `watch/replay_v2.py` | replays recent T3 history through the rules | same folder | tests, by hand |
@@ -87,6 +88,7 @@ These belong to the owner's wider setup, so they're named here rather than copie
 ```
 (cd watch && python3 -B -m unittest test_publication_watch)  # fixtures only
 (cd watch && python3 -B -m unittest test_watch_v2)           # needs the owner's T3 database
+(cd watch && python3 -B -m unittest test_board)              # board, digests and the digest-state lock
 python3 -B stale/test_stale_sweep.py                          # fixtures, but needs a local T3 install (it reads T3's environment id on import)
 ```
 

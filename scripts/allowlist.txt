@@ -18,12 +18,14 @@ scripts/live-paths.txt
 stale/stale_sweep.py
 stale/test_stale_sweep.py
 watch/GUARDIAN-PROMPT.md
+watch/board.py
 watch/config.example.json
 watch/metrics.py
 watch/open-outcomes.example.json
 watch/publication-launcher.mjs
 watch/publication_watch.py
 watch/replay_v2.py
+watch/test_board.py
 watch/test_publication_watch.py
 watch/test_watch_v2.py
 watch/triage.py

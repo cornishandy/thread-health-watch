@@ -1,5 +1,6 @@
 # repo path                      live path (the running copy; ~ is your home folder)
 watch/watch_v2.py                ~/Library/Caches/thread-watch-v2/watch_v2.py
+watch/board.py                   ~/Library/Caches/thread-watch-v2/board.py
 watch/triage.py                  ~/Library/Caches/thread-watch-v2/triage.py
 watch/metrics.py                 ~/Library/Caches/thread-watch-v2/metrics.py
 watch/replay_v2.py               ~/Library/Caches/thread-watch-v2/replay_v2.py

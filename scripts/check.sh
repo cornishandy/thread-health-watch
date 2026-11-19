@@ -61,7 +61,7 @@ home='/'"Users"'/|/home/[a-z]'
 tailnet='\.ts\.net\b|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'
 hooks='relay\.t3\.codes|hooks\.slack\.com|discord(app)?\.com/api/webhooks'
 generic="$home|$tailnet|$hooks"
-email='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+email='[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 okmail='@(users\.noreply\.github\.com|example\.invalid|example\.com|anthropic\.com)$'
 hits=$(grep -n -E "$generic" -- "${files[@]}" | cut -d: -f1,2 | tr '\n' ' ')
 [ -n "$hits" ] && bad "home paths, tailnet hosts or webhook URLs in: $hits"

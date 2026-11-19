@@ -1,121 +1,141 @@
 #!/usr/bin/env python3
 """Mechanical part of each thread-guardian wake. Read-only on T3's database.
 
-  guardian-wake check <event_id>    dedupe, waiting question cards, open-thread changes, footer
-  guardian-wake footer ["Done step" ...]   print the footer after your edits (reads andy-items.json)
-     Each Needs you row folds to one short line (topic, since, any due date); clicking it shows the row and,
-     below it, a second fold with the advisors' ranked options from andy-items-advice.json.
-  guardian-wake record <event_id> "<one plain sentence>"   save receipt + state line, lint handoff
+  guardian-wake check <event_id>
+  guardian-wake digest --slot 9am|3pm|9pm --event-id ID
+  guardian-wake footer [--slot 9am|3pm|9pm | --andy] ["Done step" ...]
+  guardian-wake record <event_id> "<one plain sentence>"
+  guardian-wake read <N read|N-M read|read all>
 
-The guardian (any model) runs `check`, does the judgment steps it prints, then `record`."""
-import hashlib, json, os, re, sqlite3, subprocess, sys, datetime
+Paths default to the live files. Override with ANDY_ITEMS, ANDY_ADVICE, ANDY_SEEN,
+BOARD_PATH, DIGEST_STATE, GUARDIAN_HANDOFF, T3_DB, BOARD_PY, OPEN_THREADS_DIR.
+"""
+import hashlib, importlib.util, json, os, re, sqlite3, subprocess, sys, datetime
 HOME = os.path.expanduser("~")
-HANDOFF = f"{HOME}/Library/Caches/handoffs/2026-10-21-audit-all-t3-threads-for-dead-ends-25824f7b/HANDOFF-25824f7b.md"
-GUARDIAN = "mcp:launch:430565ca120f865fdd2153b7c33ace065eab66edb8200219182288bd4937672e"
-DIR = f"{HOME}/Library/Caches/open-threads"
-ITEMS = f"{DIR}/andy-items.json"      # Andy's open items: [{"n":2,"topic":"...","row":"...","since":"2026-11-07","due":null}]
-ADVICE = f"{DIR}/andy-items-advice.json"  # ranked options from the Grok + Gemini advisors, by item number
-SEEN = f"{DIR}/andy-items-seen.json"      # per item: first day listed, plus its last known since/due/due_note
-DB = f"{HOME}/.t3/userdata/statev2.sqlite"
+HANDOFF_DEFAULT = f"{HOME}/Library/Caches/handoffs/2026-10-21-audit-all-t3-threads-for-dead-ends-25824f7b/HANDOFF-25824f7b.md"
+GUARDIAN = "mcp:launch:c68aac8743ad70eee9731584c43ba2412854e25a0be2e4e950ca1821efe7940e"
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DONE_FOR = {"9am": "Check the 9 AM board", "3pm": "Check the 3 PM board", "9pm": "Check the 9 PM board"}
+PREFIX_9AM = "scheduled-task-message:scheduled-task:0dd39d71-4b63-46f8-92ed-0758b46b225c"
+PREFIX_EVENTS = "scheduled-task-message:scheduled-task:command:mcp:de325ffe-ff66-4b7a-b25c-47546a0c9b64:schedule-task:guardian-events-v1"
+OPENING_9AM = "This is the 9 AM stale-thread pass, then the morning digest."
+OPENING_EVENTS = "This is the 3 PM or 9 PM digest."
+DUPLICATE_SENTENCE = "nothing new needs you"
+NO_DIGEST = "no digest yet in this thread"
+_WRAP = set("\"'`*_")
 
-def receipts():
-    for l in open(HANDOFF).read().split("\n"):
-        if l.startswith("Reviewed event IDs: "):
-            return json.loads(l[20:])
-    return []
+def _first_nonblank(text):
+    for raw in str(text or "").splitlines():
+        if raw.strip():
+            return raw.strip()
+    return ""
 
-def link(tid, title):
-    return f"[{title}](t3-thread://v1/{tid})"
+def normalise_duplicate_line(text):
+    """First nonblank line, for the duplicate test. One trailing full stop only."""
+    line = _first_nonblank(text).lower().strip()
+    line = re.sub(r"\s+", " ", line)
+    while line and line[0] in _WRAP:
+        line = line[1:].strip()
+    while line and line[-1] in _WRAP:
+        line = line[:-1].strip()
+    if line.endswith("."):
+        line = line[:-1]
+    return re.sub(r"\s+", " ", line).strip()
 
-def check(eid):
-    print("== 1. Event")
-    if not UUID.match(eid or ""):
-        print(f"INVALID event id {eid!r}: reply 'Nothing needs you.' and do not record it."); 
-    elif eid in receipts():
-        print("DUPLICATE: already handled. Reply 'Nothing needs you.' with the footer below. Do nothing else.")
-    else:
-        print("NEW")
-    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    print("\n== 2. Waiting question cards (answer each by strict rule 3; read with t3_pending_request_read)")
-    rows = con.execute("""select r.thread_id, t.title, count(*), min(r.created_at) from orchestration_v2_projection_runtime_requests r
-      join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
-      where r.status='pending' and r.kind='user_input' and r.thread_id<>?
-      and json_extract(t.payload_json,'$.settledAt') is null group by r.thread_id""", (GUARDIAN,)).fetchall()
-    if not rows: print("none")
-    for tid, title, n, since in rows:
-        print(f"- {link(tid, title)}: {n} card(s) waiting since {since[11:16]} UTC  threadId={tid}")
-    print("\n== 3. Open-thread changes since last check")
-    prev_path = f"{DIR}/latest.json"
-    prev = {r["id"]: r for r in json.load(open(prev_path))} if os.path.exists(prev_path) else {}
-    subprocess.run([f"{HOME}/.claude/bin/open-threads", "--json"], check=True)
-    cur = {r["id"]: r for r in json.load(open(prev_path))}
-    changes = []
-    for tid, r in cur.items():
-        if tid in (GUARDIAN,): continue
-        p = prev.get(tid)
-        L = link(tid, r["title"])
-        if not p: changes.append(f"NEW thread {L} ({r['verdict']})")
-        else:
-            if r["lastReply"] != p["lastReply"]:
-                changes.append(f"NEW REPLY in {L}: verdict {p['verdict']}->{r['verdict']} '{r['reason']}'. Opening: {r['bodyHead'][:220]}")
-            if r["staleRed"] and not p.get("staleRed"):
-                changes.append(f"STALE footer in {L}: says '{r['reason']}' but nothing is running. Read its finished child results and add the real result to the list.")
-    for tid in prev:
-        if tid not in cur and tid != GUARDIAN:
-            changes.append(f"SETTLED or gone: {prev[tid]['title']}")
-    print("\n".join(changes) if changes else "none")
-    print("\nIf a change is useful news or a new 'needs Andy' item, update ~/Library/Caches/open-threads/open-threads.md (plain words, a link per thread).")
-    print("\n== 4. When you've finished your edits, print the footer with:")
-    print('   ~/.claude/bin/guardian-wake footer ["Answer two waiting cards" ...]   (extra Done steps, 2-6 words each)')
-    footer([])
+def is_duplicate_assistant(text):
+    return normalise_duplicate_line(text) == DUPLICATE_SENTENCE
 
-def lead():
-    """Exact model and short name of whoever runs the guardian thread now, from T3's database."""
+def _run_message_id(run):
+    if run.get("messageId") is not None:
+        return str(run.get("messageId"))
+    return str(run.get("message_id") or "")
+
+def _run_user_text(run):
+    if run.get("text") is not None:
+        return str(run.get("text"))
+    return str(run.get("user") or "")
+
+def _run_assistant(run):
+    if run.get("assistant") is not None:
+        return str(run.get("assistant"))
+    return str(run.get("final") or "")
+
+def digest_run_qualifies(run):
+    """Completed, right messageId prefix, right opening, and not a duplicate."""
+    if str(run.get("status") or "") != "completed":
+        return False
+    message_id = _run_message_id(run)
+    if not (message_id.startswith(PREFIX_9AM) or message_id.startswith(PREFIX_EVENTS)):
+        return False
+    text = _run_user_text(run)
+    if not (text.startswith(OPENING_9AM) or text.startswith(OPENING_EVENTS)):
+        return False
+    if is_duplicate_assistant(_run_assistant(run)):
+        return False
+    return True
+
+def latest_digest(runs):
+    """Latest completed digest. A newer running or failed run does not displace it."""
+    found = None
+    for run in runs or []:
+        if digest_run_qualifies(run):
+            found = run
+    return found
+
+def digest_answer(runs):
+    """Finding from the latest digest, or the no-digest sentence."""
+    run = latest_digest(runs)
+    if not run:
+        return NO_DIGEST
+    if run.get("finding"):
+        return str(run["finding"])
+    line = _first_nonblank(_run_assistant(run))
+    return line or NO_DIGEST
+
+def section_body(text, number):
+    lines = str(text or "").splitlines()
+    prefix = f"## {number}"
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(prefix):
+            start = index + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## "):
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
+
+def standing_instructions():
+    path = paths()["handoff"]
     try:
-        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-        ms = json.loads(con.execute("select payload_json from orchestration_v2_projection_threads where thread_id=?", (GUARDIAN,)).fetchone()[0])["modelSelection"]
-        m = ms["model"]; eff = next((o["value"] for o in ms.get("options") or [] if o["id"] == "effort"), "")
-        names = {"claude-opus-5-5": ("Claude Opus 5.5", "Opus"), "claude-sonnet-5-5": ("Claude Sonnet 5.5", "Sonnet"),
-                 "gemini-4-argon-high": ("Gemini 4 Argon", "Gemini"), "gemini-3.8-flash-high": ("Gemini 3.8 Flash", "Flash"),
-                 "gpt-6.1-sol": ("GPT-6.1-Sol", "Sol"), "gpt-6-astra": ("GPT-6-Astra", "Astra")}
-        full, short = names.get(m, (m, m))
-        if m.startswith("gemini") and not eff: eff = m.rsplit("-", 1)[-1]
-        return f"{full} {eff}".strip(), short
-    except Exception:
-        return "model unknown", "lead"
+        return section_body(open(path).read(), 2)
+    except OSError:
+        return ""
 
-def footer(extra):
-    full, short = lead()
-    items = json.load(open(ITEMS)) if os.path.exists(ITEMS) else []
-    tier = subprocess.run([f"{HOME}/.claude/bin/claude-tier"], capture_output=True, text=True).stdout
-    usage = next((l.split("footer:",1)[1].strip() for l in tier.splitlines() if "footer:" in l), "Claude usage: unknown")
-    print("---\n")
-    print('| <span itemprop="settle-no">🔴 Don\'t settle yet</span> | watch still reports here |   |')
-    print("|---|---|--:|")
-    print(f"| Done | ~~Check the latest watch alert~~ | {short} · 1 min |")
-    for d in extra:
-        print(f"|   | ~~{d}~~ | {short} · 1 min |")
-    advice = load(ADVICE, {})
-    seen = load(SEEN, {})
-    today = datetime.date.today()
-    for it in items:
-        key = str(it["n"])
-        mem = seen.get(key)
-        mem = mem if isinstance(mem, dict) and mem.get("topic") == it["topic"] else {"topic": it["topic"], "first": today.isoformat()}
-        # a model editing andy-items.json can drop the date fields; the last known values fill the gap
-        for f in ("since", "due", "due_note"):
-            if it.get(f):
-                mem[f] = it[f]
-            elif f in it:
-                mem.pop(f, None)  # set to null on purpose: forget it
-            elif mem.get(f):
-                it[f] = mem[f]
-        seen[key] = mem
-        label = "Needs you" if it is items[0] else "  "  # label on the first row of the run only
-        print(f"| {label} | {needs_row(it, mem['first'], advice.get(key), today)} |   |")
-    save(SEEN, {k: v for k, v in seen.items() if k in {str(i["n"]) for i in items}})
-    print(f"\n<sub>Decided for you -- · Skills -- · Written by {full} · {usage}</sub>")
+def paths():
+    directory = os.environ.get("OPEN_THREADS_DIR", f"{HOME}/Library/Caches/open-threads")
+    return {
+        "dir": directory,
+        "items": os.environ.get("ANDY_ITEMS", f"{directory}/andy-items.json"),
+        "advice": os.environ.get("ANDY_ADVICE", f"{directory}/andy-items-advice.json"),
+        "seen": os.environ.get("ANDY_SEEN", f"{directory}/andy-items-seen.json"),
+        "handoff": os.environ.get("GUARDIAN_HANDOFF", HANDOFF_DEFAULT),
+        "board": os.environ.get("BOARD_PATH", f"{HOME}/Library/Caches/thread-watch-v2/live/board.json"),
+        "digest": os.environ.get("DIGEST_STATE", f"{HOME}/Library/Caches/thread-watch-v2/live/digest-state.json"),
+        "db": os.environ.get("T3_DB", f"{HOME}/.t3/userdata/statev2.sqlite"),
+        "latest": os.environ.get("OPEN_THREADS_LATEST", f"{directory}/latest.json"),
+    }
+
+def load_board():
+    path = os.environ.get("BOARD_PY", f"{HOME}/Library/Caches/thread-watch-v2/board.py")
+    spec = importlib.util.spec_from_file_location("quiet_board", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 def load(path, default):
     try:
@@ -129,8 +149,229 @@ def save(path, data):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=1, ensure_ascii=False)
         os.replace(tmp, path)
+        return True
     except OSError:
-        pass
+        return False
+
+def is_reading(it):
+    return str(it.get("topic") or "").startswith("Worth reading")
+
+def shown_glance(it):
+    """Glance written once on the item. Stars are stripped so it cannot go bold."""
+    raw = it.get("glance")
+    text = it.get("topic") if not raw else str(raw)
+    return str(text).replace("*", "")
+
+def apply_read(items, command):
+    """Clear reading items only. A to-do in the range, and every to-do on 'read all', stays."""
+    command = (command or "").strip()
+    if command == "read all":
+        cleared = [it["n"] for it in items if is_reading(it)]
+        return [it for it in items if not is_reading(it)], cleared
+    single = re.fullmatch(r"(\d+)\s+read", command)
+    if single:
+        number = int(single.group(1))
+        cleared, kept = [], []
+        for it in items:
+            if it.get("n") == number and is_reading(it):
+                cleared.append(number)
+            else:
+                kept.append(it)
+        return kept, cleared
+    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)\s+read", command)
+    if not match:
+        return list(items), []
+    lo, hi = int(match.group(1)), int(match.group(2))
+    if lo > hi:
+        lo, hi = hi, lo
+    cleared, kept = [], []
+    for it in items:
+        number = it.get("n")
+        if isinstance(number, int) and lo <= number <= hi and is_reading(it):
+            cleared.append(number)
+        else:
+            kept.append(it)
+    return kept, cleared
+
+def read_receipt(numbers):
+    shown = ", ".join(str(number) for number in numbers)
+    return f"~~{shown} read~~"
+
+def receipts():
+    handoff = paths()["handoff"]
+    for line in open(handoff).read().split("\n"):
+        if line.startswith("Reviewed event IDs: "):
+            return json.loads(line[20:])
+    return []
+
+def link(tid, title):
+    return f"[{title}](t3-thread://v1/{tid})"
+
+def check(eid):
+    print("== 1. Event")
+    if not UUID.match(eid or ""):
+        print(f"INVALID event id {eid!r}: reply 'Nothing needs you.' and do not record it.")
+    elif eid in receipts():
+        print("DUPLICATE: already handled. Reply 'Nothing needs you.' with the footer below. Do nothing else.")
+    else:
+        print("NEW")
+    db = paths()["db"]
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    print("\n== 2. Waiting question cards (answer each by strict rule 3; read with t3_pending_request_read)")
+    rows = con.execute("""select r.thread_id, t.title, count(*), min(r.created_at) from orchestration_v2_projection_runtime_requests r
+      join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where r.status='pending' and r.kind='user_input' and r.thread_id<>?
+      and json_extract(t.payload_json,'$.settledAt') is null group by r.thread_id""", (GUARDIAN,)).fetchall()
+    if not rows:
+        print("none")
+    for tid, title, n, since in rows:
+        print(f"- {link(tid, title)}: {n} card(s) waiting since {since[11:16]} UTC  threadId={tid}")
+    print("\n== 3. Open-thread changes since last check")
+    prev_path = paths()["latest"]
+    prev = {r["id"]: r for r in json.load(open(prev_path))} if os.path.exists(prev_path) else {}
+    subprocess.run([f"{HOME}/.claude/bin/open-threads", "--json"], check=True)
+    cur = {r["id"]: r for r in json.load(open(prev_path))}
+    changes = []
+    for tid, r in cur.items():
+        if tid in (GUARDIAN,):
+            continue
+        p = prev.get(tid)
+        linked = link(tid, r["title"])
+        if not p:
+            changes.append(f"NEW thread {linked} ({r['verdict']})")
+        else:
+            if r["lastReply"] != p["lastReply"]:
+                changes.append(f"NEW REPLY in {linked}: verdict {p['verdict']}->{r['verdict']} '{r['reason']}'. Opening: {r['bodyHead'][:220]}")
+            if r["staleRed"] and not p.get("staleRed"):
+                changes.append(f"STALE footer in {linked}: says '{r['reason']}' but nothing is running. Read its finished child results and fold them into today's Worth reading item.")
+    for tid in prev:
+        if tid not in cur and tid != GUARDIAN:
+            changes.append(f"SETTLED or gone: {prev[tid]['title']}")
+    print("\n".join(changes) if changes else "none")
+    print("\nDo not update open-threads.md. It is frozen and linked from item 8. Unread results fold into the 9 AM Worth reading item.")
+    print("\n== 4. When you've finished your edits, print the footer with:")
+    print('   ~/.claude/bin/guardian-wake footer ["Answer two waiting cards" ...]   (extra Done steps, 2-6 words each)')
+    footer([])
+
+def digest_cmd(slot, event_id):
+    board = load_board()
+    here = paths()
+    # The scanner and record take the same lock (17 Nov 9 PM lost reply).
+    with board.digest_lock(here["digest"]):
+        snapshot = board.load_json(here["board"]) or {}
+        state = board.load_json(here["digest"]) or board.empty_digest_state()
+        fp = snapshot.get("fingerprint") or board.fingerprint(snapshot)
+        if slot == "9am" and event_id not in (state.get("events") or {}):
+            board.register_event(state, event_id, fp, "9am", "9am")
+            event = state.setdefault("events", {})[event_id]
+            event["held"] = list(snapshot.get("held_outcome_ids") or [])
+            event["publication_flagged"] = list(snapshot.get("publication_flagged") or [])
+            # Consumption stops at the scan the digest displayed. A reply that
+            # arrived after that scan was not on the board and stays for later.
+            shown = snapshot.get("last_completed_scan")
+            if isinstance(shown, (int, float)):
+                event["snapshot_at"] = shown
+        text = board.digest_text(snapshot, state, slot, event_id)
+        shown_result = board.digest_result(snapshot, slot, state.get("publication_reported"))
+        event = (state.get("events") or {}).get(event_id)
+        if event is not None and "\nDUPLICATE\n" not in ("\n" + text + "\n"):
+            # Consumption and the feed's result line use what this digest showed,
+            # not the board at posting time or at record time (a scan can land in between).
+            event["publication_flagged"] = list(snapshot.get("publication_flagged") or [])
+            event["result"] = shown_result
+        state["last_slot"] = slot
+        state["last_result"] = shown_result
+        board.atomic_json(here["digest"], state)
+    if "\nDUPLICATE\n" not in ("\n" + text + "\n"):
+        board.log_trial(
+            os.path.join(os.path.dirname(here["digest"]), "trial.jsonl"),
+            "digest_posted", slot=slot, fingerprint=fp, consumed=False,
+        )
+    print(text)
+    stood = standing_instructions()
+    if stood:
+        print("\n== Standing instructions")
+        print(stood)
+
+def recorded_slot():
+    """Last consumed slot. footer does not call this: bare and --andy omit the board row."""
+    try:
+        board = load_board()
+        state = board.load_json(paths()["digest"]) or {}
+    except Exception:
+        return None
+    event = (state.get("events") or {}).get(state.get("last_consumed_event") or "") or {}
+    slot = event.get("slot") or state.get("last_slot")
+    return slot if slot in DONE_FOR else None
+
+def lead():
+    """Exact model and short name of whoever runs the guardian thread now, from T3's database."""
+    try:
+        con = sqlite3.connect(f"file:{paths()['db']}?mode=ro", uri=True)
+        ms = json.loads(con.execute("select payload_json from orchestration_v2_projection_threads where thread_id=?", (GUARDIAN,)).fetchone()[0])["modelSelection"]
+        model = ms["model"]
+        eff = next((o["value"] for o in ms.get("options") or [] if o["id"] == "effort"), "")
+        names = {"claude-opus-5-5": ("Claude Opus 5.5", "Opus"), "claude-sonnet-5-5": ("Claude Sonnet 5.5", "Sonnet"),
+                 "gemini-4-argon-high": ("Gemini 4 Argon", "Gemini"), "gemini-3.8-flash-high": ("Gemini 3.8 Flash", "Flash"),
+                 "gpt-6.1-sol": ("GPT-6.1-Sol", "Sol"), "gpt-6-astra": ("GPT-6-Astra", "Astra")}
+        full, short = names.get(model, (model, model))
+        if model.startswith("gemini") and not eff:
+            eff = model.rsplit("-", 1)[-1]
+        return f"{full} {eff}".strip(), short
+    except Exception:
+        return "model unknown", "lead"
+
+def footer(extra, slot=None, andy=False):
+    full, short = lead()
+    here = paths()
+    items = json.load(open(here["items"])) if os.path.exists(here["items"]) else []
+    tier = subprocess.run([f"{HOME}/.claude/bin/claude-tier"], capture_output=True, text=True).stdout
+    usage = next((line.split("footer:", 1)[1].strip() for line in tier.splitlines() if "footer:" in line), "Claude usage: unknown")
+    # --slot prints that board-check row. --andy and a bare call omit it and ignore GUARDIAN_SLOT.
+    show_slot = slot if slot and not andy else None
+    done = DONE_FOR.get(show_slot) if show_slot else None
+    print("---\n")
+    print('| <span itemprop="settle-no">🔴 Don\'t settle yet</span> | watch still reports here |   |')
+    print("|---|---|--:|")
+    if done:
+        print(f"| Done | ~~{done}~~ | {short} · 1 min |")
+    for step in extra:
+        print(f"|   | ~~{step}~~ | {short} · 1 min |")
+    advice = load(here["advice"], {})
+    seen = load(here["seen"], {})
+    today = datetime.date.today()
+    needs = [it for it in items if not is_reading(it)]
+    reading = [it for it in items if is_reading(it)]
+    groups = [("Needs you", needs), (f"Worth reading · {len(reading)}", reading)]
+    rendered = []
+    for label, group in groups:
+        if not group:
+            continue
+        for index, it in enumerate(group):
+            key = str(it["n"])
+            mem = seen.get(key)
+            mem = mem if isinstance(mem, dict) and mem.get("topic") == it["topic"] else {"topic": it["topic"], "first": today.isoformat()}
+            for field in ("since", "due", "due_note", "glance"):
+                if it.get(field):
+                    mem[field] = it[field]
+                elif field in it:
+                    mem.pop(field, None)
+                elif mem.get(field):
+                    it[field] = mem[field]
+            seen[key] = mem
+            cell_label = label if index == 0 else "  "
+            row = reading_row(it, mem["first"], advice.get(key), today) if is_reading(it) else needs_row(it, mem["first"], advice.get(key), today)
+            rendered.append((cell_label, row))
+    for cell_label, row in rendered:
+        print(f"| {cell_label} | {row} |   |")
+    save(here["seen"], {k: v for k, v in seen.items() if k in {str(i["n"]) for i in items}})
+    try:
+        board = load_board()
+        snapshot = board.load_json(here["board"]) or {}
+        line = board.board_line(snapshot, datetime.datetime.now().timestamp())
+    except Exception:
+        line = "Board updated · watch healthy" if False else "Board updated"
+    print(f"\n<sub>Decided for you -- · Skills -- · {line} · Written by {full} · {usage}</sub>")
 
 def day(iso):
     try:
@@ -157,8 +398,6 @@ def when(it, first_seen, today):
     return " · ".join(bits)
 
 def advice_fold(adv):
-    """The advisors' ranked options, as a fold inside the item's fold: an optional finding, then each option with
-    each advisor's rank and strength, the reply, and their rationale. Empty when there's none for this item."""
     opts = adv.get("options") or []
     if not opts:
         return ""
@@ -166,10 +405,10 @@ def advice_fold(adv):
     agree = adv.get("agreement") or ""
     head = f"Grok + Gemini both pick: {top['label']}" if agree == "both pick it" else f"Grok + Gemini: {agree or top['label']}"
     lines = [adv["finding"]] if adv.get("finding") else []
-    for i, o in enumerate(opts, 1):
-        votes = " · ".join(f"{who} {v}" for who, v in (("Grok", o.get("grok")), ("Gemini", o.get("gemini"))) if v)
-        reply = f" · <ins>Reply</ins> `{o['reply']}`" if o.get("reply") else ""
-        lines.append(f"**{i}. {o['label']}** · {votes}{reply}. {o.get('rationale', '')}")
+    for i, option in enumerate(opts, 1):
+        votes = " · ".join(f"{who} {vote}" for who, vote in (("Grok", option.get("grok")), ("Gemini", option.get("gemini"))) if vote)
+        reply = f" · <ins>Reply</ins> `{option['reply']}`" if option.get("reply") else ""
+        lines.append(f"**{i}. {option['label']}** · {votes}{reply}. {option.get('rationale', '')}")
     if adv.get("note"):
         lines.append(adv["note"])
     if adv.get("by"):
@@ -177,50 +416,136 @@ def advice_fold(adv):
     return f"<details><summary>{head}</summary>{'<br>'.join(lines)}</details>"
 
 def row_hash(it):
-    """Same function as in needs-you-advice: advice is current while the item's topic and text are unchanged."""
     return hashlib.sha256(json.dumps([it.get("topic"), it.get("row")], ensure_ascii=False).encode()).hexdigest()[:12]
 
-def needs_row(it, first_seen, adv, today):
-    """A Needs you row folded to one line: click it for the row's text and the advisors' fold."""
+def _advice_for(it, adv):
     if adv and adv.get("topic") not in (None, it["topic"]):
-        adv = None  # advice written for a different item that once had this number
+        adv = None
     if adv and adv.get("row_hash") not in (None, row_hash(it)):
-        # the item's text changed after the advice was written: still shown, marked (the trial rewrites it)
         adv = dict(adv, finding=" ".join(filter(None, [f"*Written before this item's text last changed ({adv.get('asOf', 'date unknown')}).*", adv.get("finding")])))
-    summary = f"**{it['n']}. {it['topic']}** · {when(it, first_seen, today)}"
+    return adv
+
+def item_fold(it, adv):
     note = f"*{it['due_note'][0].upper()}{it['due_note'][1:]}.* " if it.get("due_note") else ""
-    return cell(f"<details><summary>{summary}</summary>{note}{it['row']}{advice_fold(adv) if adv else ''}</details>")
+    return f"{note}{it['row']}{advice_fold(adv) if adv else ''}"
+
+def needs_row(it, first_seen, adv, today):
+    adv = _advice_for(it, adv)
+    summary = f"**{it['n']}. {it['topic']}** · {when(it, first_seen, today)}"
+    return cell(f"<details><summary>{summary}</summary>{item_fold(it, adv)}</details>")
+
+def reading_row(it, first_seen, adv, today):
+    """Plain summary. The number is a span, not bold, so the row is not styled urgent."""
+    adv = _advice_for(it, adv)
+    summary = f'<span itemprop="reading">{it["n"]}.</span> {shown_glance(it)} · {when(it, first_seen, today)}'
+    return cell(f"<details><summary>{summary}</summary>{item_fold(it, adv)}</details>")
 
 def lint(text):
-    bad = [w for w in re.findall(r"[A-Za-z]{28,}", text) if not w.startswith("http")]
+    bad = [word for word in re.findall(r"[A-Za-z]{28,}", text) if not word.startswith("http")]
     return bad
 
 def record(eid, note):
-    t = open(HANDOFF).read()
-    L = t.split("\n")
-    for i, l in enumerate(L):
-        if l.startswith("Reviewed event IDs: "):
-            a = json.loads(l[20:])
-            if UUID.match(eid) and eid not in a: a.append(eid)
-            L[i] = "Reviewed event IDs: " + json.dumps(a[-200:])
+    handoff = paths()["handoff"]
+    text = open(handoff).read()
+    lines = text.split("\n")
+    seen = []
+    for line in lines:
+        if line.startswith("Reviewed event IDs: "):
+            seen = json.loads(line[20:])
+            break
+    if eid in seen:
+        print("REFUSED: already in Reviewed event IDs")
+        return
+    try:
+        board = load_board()
+        here = paths()
+        # Same lock as the scanner, so a scan finishing now can't overwrite this reply.
+        with board.digest_lock(here["digest"]):
+            state = board.load_json(here["digest"]) or {}
+            event = (state.get("events") or {}).get(eid)
+            if event:
+                trial = os.path.join(os.path.dirname(here["digest"]), "trial.jsonl")
+                # last_result describes what this digest showed: the result saved when it was
+                # rendered, else the reported set from before consuming it.
+                reported_before = list(state.get("publication_reported") or [])
+                shown_result = event.get("result")
+                if shown_result is None:
+                    shown_result = state.get("last_result")
+                board.consume(state, eid, event.get("source") or "events", log_path=trial)
+                snapshot = board.load_json(here["board"]) or {}
+                slot = event.get("slot")
+                if slot:
+                    state["last_slot"] = slot
+                state["last_result"] = shown_result if shown_result is not None else board.digest_result(snapshot, slot, reported_before)
+                board.atomic_json(here["digest"], state)
+                board.log_trial(
+                    trial, "judgment", slot=slot, fingerprint=event.get("fingerprint"), consumed=True,
+                )
+    except Exception as exc:
+        # Stop before the event joins Reviewed event IDs, so the same record command can be retried.
+        print(f"NOT RECORDED: digest state not updated ({type(exc).__name__}: {exc}). "
+              "Run the same record command again in a minute.")
+        sys.exit(3)
+    handoff = paths()["handoff"]
+    text = open(handoff).read()
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("Reviewed event IDs: "):
+            seen = json.loads(line[20:])
+            if UUID.match(eid) and eid not in seen:
+                seen.append(eid)
+            lines[i] = "Reviewed event IDs: " + json.dumps(seen[-200:])
     now = datetime.datetime.now().strftime("%d %b %H:%M")
-    # newest state line goes first under '## 1. State'; keep at most 8 state lines
-    head = L.index("## 1. State")
-    body_end = next(i for i in range(head+1, len(L)) if L[i].startswith("## "))
-    lines = [x for x in L[head+1:body_end] if x.strip()]
-    lines = [f"- {now}: {note.strip()}"] + lines
-    L[head+1:body_end] = lines[:8] + [""]
-    new = "\n".join(L)
+    head = lines.index("## 1. State")
+    body_end = next(i for i in range(head + 1, len(lines)) if lines[i].startswith("## "))
+    body = [line for line in lines[head + 1:body_end] if line.strip()]
+    body = [f"- {now}: {note.strip()}"] + body
+    lines[head + 1:body_end] = body[:8] + [""]
+    new = "\n".join(lines)
     bad = lint(new)
     if bad:
-        print("LINT FAIL: run-together words in the handoff (write normal sentences with spaces):", bad[:5]); sys.exit(2)
-    open(HANDOFF, "w").write(new)
+        print("LINT FAIL: run-together words in the handoff (write normal sentences with spaces):", bad[:5])
+        sys.exit(2)
+    open(handoff, "w").write(new)
     size = len(new.encode())
-    print(f"recorded. handoff {size//1024} KB" + ("  WARNING: over 20 KB, merge old entries" if size > 20480 else ""))
-    print(subprocess.run([f"{HOME}/.claude/bin/handover", "check", "--thread", GUARDIAN], capture_output=True, text=True).stdout.strip().splitlines()[-1])
+    print(f"recorded. handoff {size // 1024} KB" + ("  WARNING: over 20 KB, merge old entries" if size > 20480 else ""))
+
+def _flag(argv, name):
+    if name in argv:
+        index = argv.index(name)
+        if index + 1 < len(argv):
+            value = argv[index + 1]
+            del argv[index:index + 2]
+            return value
+    return None
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "check": check(sys.argv[2])
-    elif len(sys.argv) >= 2 and sys.argv[1] == "footer": footer(sys.argv[2:])
-    elif len(sys.argv) >= 4 and sys.argv[1] == "record": record(sys.argv[2], sys.argv[3])
-    else: print(__doc__); sys.exit(1)
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "check":
+        check(args[1])
+    elif len(args) >= 1 and args[0] == "footer":
+        rest = args[1:]
+        andy = "--andy" in rest
+        if andy:
+            rest = [part for part in rest if part != "--andy"]
+        slot = _flag(rest, "--slot")
+        footer(rest, None if andy else slot, andy=andy)
+    elif len(args) >= 1 and args[0] == "digest":
+        rest = args[1:]
+        slot = _flag(rest, "--slot") or "9pm"
+        event_id = _flag(rest, "--event-id") or ""
+        digest_cmd(slot, event_id)
+    elif len(args) >= 3 and args[0] == "record":
+        record(args[1], args[2])
+    elif len(args) >= 2 and args[0] == "read":
+        command = " ".join(args[1:])
+        here = paths()
+        items = load(here["items"], [])
+        kept, cleared = apply_read(items, command)
+        if not save(here["items"], kept):
+            print("read failed: the list was not saved")
+            sys.exit(2)
+        print(read_receipt(cleared) if cleared else "cleared none")
+    else:
+        print(__doc__)
+        sys.exit(1)

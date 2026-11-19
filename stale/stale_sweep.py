@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily stale-thread pass for the Thread Health Watch (trial to 14 Nov 2026; Andy picked it 7 Nov 2026).
+"""Daily stale-thread pass for the Thread Health Watch (permanent; Andy kept it 15 Nov 2026).
 
 Finds Andy's unsettled top-level threads idle for 12 h or more, writes one extract per thread (Andy's messages,
 agent relays, and every reply after his last message), checks the git repos and GitHub PRs those replies name,
@@ -19,7 +19,7 @@ DB = f"{HOME}/.t3/userdata/statev2.sqlite"
 BASE = f"{HOME}/Library/Caches/stale-thread-triage"
 LOG = f"{BASE}/settled-log.jsonl"
 SETTLE_LIB = f"{HOME}/Library/Caches/settle-sweep"  # t3session.py: T3's own guarded settle route
-TRIAL_END = date(2026, 11, 14)
+TRIAL_END = None  # Andy made the existing daily pass permanent on 15 Nov 2026.
 ENV = open(f"{HOME}/.t3/userdata/environment-id").read().strip()
 ACTIVE = ("queued", "preparing", "starting", "running", "waiting")
 KEEP_OPEN = re.compile(r"(?i)\b(keep|leave)\s+(this\s+|the\s+|it\s+)?(thread\s+)?(open|unsettled|active)\b|\bdon'?t\s+settle\b|\bdo\s+not\s+settle\b|\bnot\s+settle\b")
@@ -132,7 +132,7 @@ def unsettled_by_hand(con):
 
 
 def settle(ids):
-    if date.today() > TRIAL_END:
+    if TRIAL_END is not None and date.today() > TRIAL_END:
         sys.exit("TRIAL ENDED (14 Nov 2026): no settling; ask Andy keep or stop")
     now = datetime.now(timezone.utc)
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
@@ -168,7 +168,7 @@ def main():
     if "--settle" in sys.argv:
         return settle(sys.argv[sys.argv.index("--settle") + 1:])
     test_ids = sys.argv[sys.argv.index("--test-ids") + 1:] if "--test-ids" in sys.argv else None
-    if date.today() > TRIAL_END and not test_ids:
+    if TRIAL_END is not None and date.today() > TRIAL_END and not test_ids:
         print("TRIAL ENDED (14 Nov 2026): don't sweep; ask Andy keep or stop"); return
     hours = 0 if test_ids else (float(sys.argv[sys.argv.index("--min-idle-hours") + 1]) if "--min-idle-hours" in sys.argv else 12)
     now = datetime.now(timezone.utc)

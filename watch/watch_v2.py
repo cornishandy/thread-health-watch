@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+import board
 import triage
 
 P = "orchestration_v2_projection_"
@@ -286,6 +287,19 @@ class MacPresence:
         return presence
 
 
+PAUSED_RETRY_SECONDS = 5
+
+
+def next_scan_at(now, state, selected):
+    """A scan that paused on its read budget resumes in seconds, whatever the presence profile.
+
+    Otherwise an idle Mac (one scan every 600 s) needs two full intervals to finish a
+    paused scan, and the board passes health.py's 15-minute limit.
+    """
+    paused = isinstance(state, dict) and (state.get("read_cursor") or state.get("hydration_cursor"))
+    return now + (PAUSED_RETRY_SECONDS if paused else selected["scan_seconds"])
+
+
 def policy(presence):
     idle = presence["idle_seconds"]
     if not presence["locked"] and (presence["media_awake"] or idle < 300):
@@ -520,9 +534,12 @@ def read_world(database, excluded, needed_answer_runs=None, busy_run_ids=None, r
                 ANSWER_CHUNK,
             )
         answers = {}
+        plain_asks = {}
         for row in answer_rows:
             text = row.get("text") or ""
             at = triage.stamp(row.get("completed")) or triage.stamp(row.get("updated_at"))
+            if board.is_plain_question(text):
+                plain_asks.setdefault(row["run_id"], []).append({"message_id": row["turn_item_id"], "at": at})
             answers.setdefault(row["run_id"], []).append(triage.classify_answer(text, row["turn_item_id"], at))
             row["text"] = ""
         for rows in answers.values():
@@ -537,6 +554,8 @@ def read_world(database, excluded, needed_answer_runs=None, busy_run_ids=None, r
             "requests": requests,
             "cards": cards,
             "signatures": signatures,
+            "plain_asks": plain_asks,
+            "user_heads": {},
         }
     finally:
         db.close()
@@ -793,7 +812,108 @@ def summary(state, policy_name, mode):
     return body
 
 
+def _reply_meta(row):
+    """Classification only. Reply text never lands in the carried state."""
+    kept = {}
+    for key in ("message_id", "at", "verdict", "needs_you", "running"):
+        if key in (row or {}):
+            kept[key] = row.get(key)
+    return kept
+
+
+def _runs_missing_answers(frame):
+    """Runs on top-level roots whose reply metadata the incident pass did not load."""
+    missing = []
+    threads = frame.get("threads") or {}
+    answers = frame.get("answers") or {}
+    for root, member_ids in (frame.get("members") or {}).items():
+        info = threads.get(root) or {}
+        if not info.get("top"):
+            continue
+        for thread_id in member_ids:
+            for run in (frame.get("runs") or {}).get(thread_id) or []:
+                run_id = run.get("run_id")
+                if run_id and run_id not in answers:
+                    missing.append(run_id)
+    return missing
+
+
+def _hydrate_board_answers(config, frame, excluded, state):
+    """Load verdicts and final-reply ids for roots select_roots left out.
+
+    The board still classifies those roots. Without this metadata a settled
+    green thread becomes no_verdict and its unread final leaves the morning
+    queue. Triage has already run; this does not select incidents. A budget
+    miss stores hydration_cursor only and leaves the frame unpublished.
+    """
+    missing = _runs_missing_answers(frame)
+    if not missing:
+        state.pop("hydration_cursor", None)
+        return
+    try:
+        detail = read_world(
+            config["database"], excluded, needed_answer_runs=set(missing), busy_run_ids=[],
+            resume=state.get("hydration_cursor") or None,
+            stage="detail",
+        )
+    except BudgetExceeded as paused:
+        state["hydration_cursor"] = paused.cursor
+        raise
+    answers = frame.setdefault("answers", {})
+    plain = frame.setdefault("plain_asks", {})
+    for run_id, rows in (detail.get("answers") or {}).items():
+        if run_id not in answers:
+            answers[run_id] = rows
+    for run_id, rows in (detail.get("plain_asks") or {}).items():
+        if run_id not in plain:
+            plain[run_id] = rows
+    state.pop("hydration_cursor", None)
+
+
+def _merge_carried_replies(state, frame):
+    """Keep verdicts and final-reply ids for roots this scan did not reselect.
+
+    An unchanged completed thread is absent from the detail read. Without the
+    previous classification the board treats it as no_verdict and drops its
+    unread final from the morning queue.
+    """
+    stored = state.setdefault("board_replies", {})
+    stored_plain = state.setdefault("board_plain_asks", {})
+    fresh = frame.get("answers") or {}
+    fresh_plain = frame.get("plain_asks") or {}
+    for run_id, rows in fresh.items():
+        stored[run_id] = [_reply_meta(row) for row in rows]
+        if run_id in fresh_plain:
+            stored_plain[run_id] = [
+                {"message_id": item.get("message_id"), "at": item.get("at")}
+                for item in fresh_plain[run_id]
+            ]
+        else:
+            stored_plain.pop(run_id, None)
+    answers = {run_id: [dict(row) for row in rows] for run_id, rows in fresh.items()}
+    plain = {run_id: [dict(item) for item in rows] for run_id, rows in fresh_plain.items()}
+    seen = set()
+    for rows in (frame.get("runs") or {}).values():
+        for run in rows:
+            run_id = run.get("run_id")
+            if not run_id:
+                continue
+            seen.add(run_id)
+            if run_id in answers or run_id not in stored:
+                continue
+            answers[run_id] = [dict(row) for row in stored[run_id]]
+            if stored_plain.get(run_id):
+                plain[run_id] = [dict(item) for item in stored_plain[run_id]]
+    for run_id in list(stored):
+        if run_id not in seen:
+            stored.pop(run_id, None)
+            stored_plain.pop(run_id, None)
+    frame["answers"] = answers
+    frame["plain_asks"] = plain
+
+
 def scan(config, state, now):
+    scan.completed_frame = None
     excluded = set(config.get("excluded_thread_ids") or [])
     startup = not state.get("baseline")
     resume = state.get("read_cursor") or None
@@ -805,6 +925,7 @@ def scan(config, state, now):
         )
     except BudgetExceeded as paused:
         state["read_cursor"] = paused.cursor
+        scan.completed_frame = None
         return state, [], set(), []
     roots = select_roots(frame, state, now, excluded)
     answers = answer_runs_for(frame, roots, state, startup)
@@ -825,12 +946,22 @@ def scan(config, state, now):
             )
             frame["items"] = detail["items"]
             frame["answers"] = detail["answers"]
+            frame["plain_asks"] = detail.get("plain_asks") or {}
     except BudgetExceeded as paused:
         state["read_cursor"] = paused.cursor
+        scan.completed_frame = None
         return state, [], set(), []
     state.pop("read_cursor", None)
     outcomes = load_outcomes(config["_outcomes"]) if config.get("_outcomes") else []
     logs, waiting, roots = apply_world(state, frame, now, excluded, outcomes)
+    try:
+        # After triage, so reply metadata cannot open an incident on a root the scanner skipped.
+        _hydrate_board_answers(config, frame, excluded, state)
+    except BudgetExceeded:
+        scan.completed_frame = None
+        return state, logs, waiting, roots
+    _merge_carried_replies(state, frame)
+    scan.completed_frame = frame
     return state, logs, waiting, roots
 
 
@@ -858,7 +989,13 @@ def queue_pressure(config, now):
 
 
 def deliver(state, config, now, sender=None, pressure=None):
-    """POST due incidents. Failures record a backoff and never the exception text."""
+    """POST due incidents. Failures record a backoff and never the exception text.
+
+    per_event_delivery stays on when the key is absent. Cutover sets it false,
+    and then this returns before any POST.
+    """
+    if not board.per_event_enabled(config):
+        return False
     if pressure and pressure["blocked"]:
         return False
     if now < state.get("retry_at", 0):
@@ -985,6 +1122,8 @@ def run_once(config, mode, now=None, sender=None, notifier=None, presence=None):
         presence = MacPresence().sample(now)
     selected = policy(presence)
     state, logs, waiting, _roots = scan(config, state, now)
+    frame = getattr(scan, "completed_frame", None)
+    scan.completed_frame = None
     state["last_scan"] = now
     state["policy"] = selected["name"]
     state["heartbeat"] = now
@@ -992,6 +1131,10 @@ def run_once(config, mode, now=None, sender=None, notifier=None, presence=None):
     lines = [format_log(entry) for entry in logs]
     if mode == "dry-run":
         return state, report
+    try:
+        board.sync_after_scan(config, state, frame, now, mode)
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        append_lines(config["_log"], ["board_failed"])
     if mode == "shadow":
         append_lines(config["_shadow"], lines)
         atomic_json(config["_state"], state)
@@ -1003,6 +1146,8 @@ def run_once(config, mode, now=None, sender=None, notifier=None, presence=None):
         pressure = {"blocked": False, "queued_reviews": 0, "pending_windows": 0, "oldest_queued_seconds": 0}
         state["last_error"] = "queue_pressure"
     state["queue_pressure"] = {key: pressure[key] for key in ("blocked", "queued_reviews", "pending_windows")}
+    if not board.per_event_enabled(config):
+        append_lines(config["_log"], ["per_event_delivery=0"])
     delivered = deliver(state, config, now, sender=sender, pressure=pressure)
     if state.get("_day_notice"):
         notify("watch over budget", runner=notifier)
@@ -1070,7 +1215,7 @@ def main(argv=None):
                     pass
                 else:
                     _state, report = run_once(config, mode, now=now, presence=presence)
-                    next_scan = now + selected["scan_seconds"]
+                    next_scan = next_scan_at(now, _state, selected)
                     if mode == "dry-run":
                         print(json.dumps(report, sort_keys=True))
                         return

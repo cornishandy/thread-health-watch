@@ -2,6 +2,10 @@
 
 Andy's decisions about the Watch, newest first, in his own words where he gave them. Times are US Eastern.
 
+## 18 Nov 2026
+
+- **1:21 PM: fix the lost digest reply.** "Fix it in a fresh thread (Recommended)". On 17 Nov a scan saved its older copy of `digest-state.json` over the 9 PM reply the hub had just recorded. The scanner, the digest poster and `guardian-wake digest`/`record` now share a file lock on `digest-state.json.lock`; the poster sends outside the lock and then merges only its own entries; `record` says NOT RECORDED and can be re-run if it can't get the lock. Installed 1:38 PM; the 3 PM digest's reply was kept.
+
 ## 8 Nov 2026
 
 - **Morning: the stale-thread pass looks at threads idle 12 hours.** He first lowered the cutoff from 48 to 24 hours, then said "change to 12 hours". `stale/stale_sweep.py`, its test and rule 12 now use 12 hours.

@@ -359,6 +359,10 @@ def save_report(report):
 
 def send_event(config, report):
     route = read_json(config['guardian_config'])
+    # On when the key is absent. Cutover sets it false; return before any POST.
+    # The route is never printed.
+    if route.get('per_event_delivery', True) is False:
+        return {'skipped': True}
     eid, iid = str(uuid.uuid4()), str(uuid.uuid4())
     payload = {'event_id': eid, 'kind': 'publication_health', 'incidents': [
         {'id': iid, 'code': 'publication_status', 'root': route['guardian_thread_id'],
@@ -408,8 +412,10 @@ def main(argv=None):
             state['last_notified'] = signature
         elif signature != state['last_notified']:
             try:
-                state['last_delivery'] = send_event(config, report)
-                state['last_notified'] = signature
+                delivered = send_event(config, report)
+                if delivered and not delivered.get('skipped'):
+                    state['last_delivery'] = delivered
+                    state['last_notified'] = signature
             except Exception as exc:
                 state['delivery_error'] = type(exc).__name__
         atomic(BASE / 'publication-state.json', state)
